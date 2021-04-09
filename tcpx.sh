@@ -4,7 +4,7 @@ export PATH
 #=================================================
 #	System Required: CentOS 7/8,Debian/ubuntu,oraclelinux
 #	Description: BBR+BBRplus+Lotserver
-#	Version: 1.3.2.77
+#	Version: 1.3.2.78
 #	Author: 千影,cx9208,YLX
 #	更新内容及反馈:  https://blog.ylx.me/archives/783.html
 #=================================================
@@ -15,7 +15,7 @@ export PATH
 # SKYBLUE='\033[0;36m'
 # PLAIN='\033[0m'
 
-sh_ver="1.3.2.77"
+sh_ver="1.3.2.78"
 github="github.000060000.xyz"
 
 imgurl=""
@@ -103,7 +103,7 @@ installbbr(){
 			# echo -e "${Error} 还在用32位，别再见了 !" && exit 1	
 		# fi
 		
-	elif [[ "${release}" == "ubuntu" ]]; then
+	elif [[ "${release}" == "ubuntu" || "${release}" == "debian" ]]; then
 		if [[ ${bit} = "x86_64" ]]; then
 			kernel_version="5.11.4"
 			detele_kernel_head
@@ -121,28 +121,27 @@ installbbr(){
 			echo -e "${Error} 还在用32位，别再见了 !" && exit 1	
 		fi	
 		
-	elif [[ "${release}" == "debian" ]]; then
-		if [[ ${bit} = "x86_64" ]]; then
-			debian_ver=$(curl -s http://http.us.debian.org/debian/pool/main/l/linux-signed-amd64/ | grep 'linux-image' | grep -v 'cloud' | grep -v 'rt' | grep -v 'bpo' | grep -v 'rt' | grep -v 'linux-image-amd64' | tail -1 | awk -F '>' '{print $7}' | awk -F '<' '{print $1}' | awk -F '[-]' '{print $5}' | awk -F '[_]' '{print $2}')
-			# kernel_version="5.11.4"
-			echo -e "获取的内核版本号为：${debian_ver}"
-			kernel_version=$debian_ver
-			detele_kernel_head
-			# headurl=https://chinagz2018-my.sharepoint.com/:u:/g/personal/ylx_chinagz2018_onmicrosoft_com/Ecf2jKD5wSJDjuXn6r58bzIBV6ng3oaiOZYmSd3XQyr3vg?download=1
-			# imgurl=https://chinagz2018-my.sharepoint.com/:u:/g/personal/ylx_chinagz2018_onmicrosoft_com/EaYu3pW-bxJMrBvOuLya148B9U4ALTM77uU_Sdr6uFDHqg?download=1
-			headurl=http://ftp.debian.org/debian/pool/main/l/linux-signed-amd64/$(curl -s http://http.us.debian.org/debian/pool/main/l/linux-signed-amd64/ | grep 'linux-headers' | grep -v 'cloud' | grep -v 'rt' | grep -v 'bpo' | grep -v 'rt' | grep -v 'linux-image-amd64' | tail -1 | awk -F '>' '{print $7}' | awk -F '<' '{print $1}')
-			imgurl=http://ftp.debian.org/debian/pool/main/l/linux-signed-amd64/$(curl -s http://http.us.debian.org/debian/pool/main/l/linux-signed-amd64/ | grep 'linux-image' | grep -v 'cloud' | grep -v 'rt' | grep -v 'bpo' | grep -v 'rt' | grep -v 'linux-image-amd64' | tail -1 | awk -F '>' '{print $7}' | awk -F '<' '{print $1}')
-			echo -e "正在检查headers下载连接...."
-			checkurl $headurl
-			echo -e "正在检查内核下载连接...."
-			checkurl $imgurl
-			wget -N -O linux-headers-d10.deb $headurl
-			wget -N -O linux-image-d10.deb $imgurl
-			dpkg -i linux-image-d10.deb
-			dpkg -i linux-headers-d10.deb
-		else
-			echo -e "${Error} 还在用32位，别再见了 !" && exit 1	
-		fi	
+	# elif [[ "${release}" == "debian" ]]; then
+		# if [[ ${bit} = "x86_64" ]]; then
+			# debian_ver=$(curl -s http://http.us.debian.org/debian/pool/main/l/linux-signed-amd64/ | grep 'linux-image' | grep -v 'cloud' | grep -v 'rt' | grep -v 'bpo' | grep -v 'rt' | grep -v 'linux-image-amd64' | tail -1 | awk -F '>' '{print $7}' | awk -F '<' '{print $1}' | awk -F '[-]' '{print $5}' | awk -F '[_]' '{print $2}')
+			
+			# echo -e "获取的内核版本号为：${debian_ver}"
+			# kernel_version=$debian_ver
+			# detele_kernel_head
+		
+			# headurl=http://ftp.debian.org/debian/pool/main/l/linux-signed-amd64/$(curl -s http://http.us.debian.org/debian/pool/main/l/linux-signed-amd64/ | grep 'linux-headers' | grep -v 'cloud' | grep -v 'rt' | grep -v 'bpo' | grep -v 'rt' | grep -v 'linux-image-amd64' | tail -1 | awk -F '>' '{print $7}' | awk -F '<' '{print $1}')
+			# imgurl=http://ftp.debian.org/debian/pool/main/l/linux-signed-amd64/$(curl -s http://http.us.debian.org/debian/pool/main/l/linux-signed-amd64/ | grep 'linux-image' | grep -v 'cloud' | grep -v 'rt' | grep -v 'bpo' | grep -v 'rt' | grep -v 'linux-image-amd64' | tail -1 | awk -F '>' '{print $7}' | awk -F '<' '{print $1}')
+			# echo -e "正在检查headers下载连接...."
+			# checkurl $headurl
+			# echo -e "正在检查内核下载连接...."
+			# checkurl $imgurl
+			# wget -N -O linux-headers-d10.deb $headurl
+			# wget -N -O linux-image-d10.deb $imgurl
+			# dpkg -i linux-image-d10.deb
+			# dpkg -i linux-headers-d10.deb
+		# else
+			# echo -e "${Error} 还在用32位，别再见了 !" && exit 1	
+		# fi	
 	fi
 	
 	cd .. && rm -rf bbr	
@@ -173,7 +172,7 @@ installbbrplus(){
 				yum install -y kernel-c7.rpm
 				yum install -y kernel-headers-c7.rpm
 			else
-					echo -e "${Error} 还在用32位，别再见了 !" && exit 1
+				echo -e "${Error} 还在用32位，别再见了 !" && exit 1
 			fi
 		fi	
 		
@@ -350,6 +349,7 @@ installxanmod(){
 		fi
 		
 	elif [[ "${release}" == "debian" || "${release}" == "ubuntu" ]]; then
+	
 		if [[ ${bit} = "x86_64" ]]; then
 			# kernel_version="5.11.4-xanmod"
 			# xanmod_ver_b=$(rm -rf /tmp/url.tmp && curl -o /tmp/url.tmp 'https://dl.xanmod.org/dl/changelog/?C=N;O=D' && grep folder.gif /tmp/url.tmp | head -n 1 | awk -F "[/]" '{print $5}' | awk -F "[>]" '{print $2}')
@@ -379,7 +379,7 @@ installxanmod(){
 			dpkg -i linux-image-d10.deb
 			dpkg -i linux-headers-d10.deb
 		else
-			echo -e "${Error} 还在用32位，别再见了 !" && exit 1	
+			echo -e "${Error} 还在用32位，别再见了 !" && exit 1
 		fi		
 	fi
 	
@@ -447,8 +447,6 @@ installbbrplusnew(){
 	echo -e "${Tip} 内核安装完毕，请参考上面的信息检查是否安装成功,默认从排第一的高版本内核启动"
 
 }
-
-
 
 #启用BBR+fq
 startbbrfq(){
@@ -1083,7 +1081,7 @@ echo -e "${Info}johnrosen1优化方案应用结束，可能需要重启！"
 #更新脚本
 Update_Shell(){
 	echo -e "当前版本为 [ ${sh_ver} ]，开始检测最新版本..."
-	sh_new_ver=$(wget -qO- "https://${github}/tcpx.sh"|grep 'sh_ver="'|awk -F "=" '{print $NF}'|sed 's/\"//g'|head -1)
+	sh_new_ver=$(wget -qO- "https://git.io/JYxKU"|grep 'sh_ver="'|awk -F "=" '{print $NF}'|sed 's/\"//g'|head -1)
 	[[ -z ${sh_new_ver} ]] && echo -e "${Error} 检测最新版本失败 !" && start_menu
 	if [[ ${sh_new_ver} != ${sh_ver} ]]; then
 		echo -e "发现新版本[ ${sh_new_ver} ]，是否更新？[Y/n]"
@@ -1104,7 +1102,7 @@ Update_Shell(){
 #切换到卸载内核版本
 gototcp(){
 	clear
-	wget -N "https://github.000060000.xyz/tcp.sh" && chmod +x tcp.sh && ./tcp.sh
+	wget -O tcp.sh "https://git.io/coolspeeda" && chmod +x tcp.sh && ./tcp.sh
 }
 
 #切换到秋水逸冰BBR安装脚本
@@ -1591,7 +1589,7 @@ check_sys_bbrplusnew(){
 check_sys_xanmod(){
 	check_version
 	if [[ "${release}" == "centos" ]]; then
-		if [[ ${version} = "7" || ${version} = "8" ]]; then
+		if [[ ${version} = "7" ]]; then
 			installxanmod
 		else
 			echo -e "${Error} xanmod内核不支持当前系统 ${release} ${version} ${bit} !" && exit 1
