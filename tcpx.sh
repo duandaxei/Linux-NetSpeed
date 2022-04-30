@@ -4,7 +4,7 @@ export PATH
 #=================================================
 #	System Required: CentOS 7/8,Debian/ubuntu,oraclelinux
 #	Description: BBR+BBRplus+Lotserver
-#	Version: 1.3.2.104
+#	Version: 100.0.1.2
 #	Author: 千影,cx9208,YLX
 #	更新内容及反馈:  https://blog.ylx.me/archives/783.html
 #=================================================
@@ -15,7 +15,7 @@ export PATH
 # SKYBLUE='\033[0;36m'
 # PLAIN='\033[0m'
 
-sh_ver="1.3.2.104"
+sh_ver="100.0.1.2"
 github="raw.githubusercontent.com/ylx2016/Linux-NetSpeed/master"
 
 imgurl=""
@@ -46,7 +46,7 @@ checkurl() {
 
 #cn使用fastgit.org的github加速
 check_cn() {
-  geoip=$(wget --no-check-certificate -qO- https://api.ip.sb/geoip -T 10 | grep "\"country_code\":\"CN\"")
+  geoip=$(wget --user-agent="Mozilla/5.0 (Windows NT 6.1; WOW64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/100.0.4896.127 Safari/537.36" --no-check-certificate -qO- https://api.ip.sb/geoip -T 10 | grep "\"country_code\":\"CN\"")
   if [[ "$geoip" != "" ]]; then
     # echo "下面使用fastgit.org的加速服务"
     # echo ${1//github.com/download.fastgit.org}
@@ -657,7 +657,7 @@ remove_bbr_lotserver() {
   rm -rf bbrmod
 
   if [[ -e /appex/bin/lotServer.sh ]]; then
-    echo | bash <(wget -qO- https://git.io/lotServerInstall.sh) uninstall
+    echo | bash <(wget -qO- https://raw.githubusercontent.com/fei5seven/lotServer/master/lotServerInstall.sh) uninstall
   fi
   clear
   # echo -e "${Info}:清除bbr/lotserver加速完成。"
@@ -734,7 +734,7 @@ remove_all() {
   sed -i '/net.ipv4.tcp_timestamps/d' /etc/sysctl.conf
   sed -i '/net.ipv4.tcp_max_orphans/d' /etc/sysctl.conf
   if [[ -e /appex/bin/lotServer.sh ]]; then
-    bash <(wget -qO- https://git.io/lotServerInstall.sh) uninstall
+    bash <(wget -qO- https://raw.githubusercontent.com/fei5seven/lotServer/master/lotServerInstall.sh) uninstall
   fi
   clear
   echo -e "${Info}:清除加速完成。"
@@ -883,23 +883,18 @@ optimizing_system_johnrosen1() {
   sed -i '/net.nf_conntrack_max/d' /etc/sysctl.d/99-sysctl.conf
 
   cat >'/etc/sysctl.d/99-sysctl.conf' <<EOF
-#!!! Do not change these settings unless you know what you are doing !!!
 net.ipv4.conf.all.route_localnet=1
 net.ipv4.ip_forward = 1
 net.ipv4.conf.all.forwarding = 1
 net.ipv4.conf.default.forwarding = 1
-
 net.ipv6.conf.all.forwarding = 1
 net.ipv6.conf.default.forwarding = 1
 net.ipv6.conf.lo.forwarding = 1
-
 net.ipv6.conf.all.disable_ipv6 = 0
 net.ipv6.conf.default.disable_ipv6 = 0
 net.ipv6.conf.lo.disable_ipv6 = 0
-
 net.ipv6.conf.all.accept_ra = 2
 net.ipv6.conf.default.accept_ra = 2
-
 net.core.netdev_max_backlog = 100000
 net.core.netdev_budget = 50000
 net.core.netdev_budget_usecs = 5000
@@ -909,8 +904,7 @@ net.core.wmem_max = 67108864
 net.core.rmem_default = 67108864
 net.core.wmem_default = 67108864
 net.core.optmem_max = 65536
-net.core.somaxconn = 10000
-
+net.core.somaxconn = 1000000
 net.ipv4.icmp_echo_ignore_all = 0
 net.ipv4.icmp_echo_ignore_broadcasts = 1
 net.ipv4.icmp_ignore_bogus_error_responses = 1
@@ -922,67 +916,54 @@ net.ipv4.conf.all.send_redirects = 0
 net.ipv4.conf.default.send_redirects = 0
 net.ipv4.conf.default.rp_filter = 0
 net.ipv4.conf.all.rp_filter = 0
-net.ipv4.tcp_keepalive_time = 1200
+net.ipv4.tcp_keepalive_time = 600
 net.ipv4.tcp_keepalive_intvl = 15
-net.ipv4.tcp_keepalive_probes = 5
-net.ipv4.tcp_synack_retries = 2
-net.ipv4.tcp_syncookies = 0
+net.ipv4.tcp_keepalive_probes = 2
+net.ipv4.tcp_synack_retries = 1
+net.ipv4.tcp_syncookies = 1
 net.ipv4.tcp_rfc1337 = 0
 net.ipv4.tcp_timestamps = 1
-net.ipv4.tcp_tw_reuse = 1
+net.ipv4.tcp_tw_reuse = 0
 net.ipv4.tcp_fin_timeout = 15
 net.ipv4.ip_local_port_range = 1024 65535
-net.ipv4.tcp_max_tw_buckets = 2000000
-net.ipv4.tcp_fastopen = 3
+net.ipv4.tcp_max_tw_buckets = 5000
+net.ipv4.tcp_fastopen = 4
 net.ipv4.tcp_rmem = 4096 87380 67108864
 net.ipv4.tcp_wmem = 4096 65536 67108864
 net.ipv4.udp_rmem_min = 8192
 net.ipv4.udp_wmem_min = 8192
-net.ipv4.tcp_mtu_probing = 0
-
-#net.ipv4.conf.all.arp_ignore = 2
-#net.ipv4.conf.default.arp_ignore = 2
-#net.ipv4.conf.all.arp_announce = 2
-#net.ipv4.conf.default.arp_announce = 2
-
+net.ipv4.tcp_mtu_probing = 1
 net.ipv4.tcp_autocorking = 0
 net.ipv4.tcp_slow_start_after_idle = 0
-net.ipv4.tcp_max_syn_backlog = 30000
-net.core.default_qdisc = fq
-net.ipv4.tcp_congestion_control = bbr
+net.ipv4.tcp_max_syn_backlog = 819200
 net.ipv4.tcp_notsent_lowat = 16384
-net.ipv4.tcp_no_metrics_save = 1
-net.ipv4.tcp_ecn = 2
+net.ipv4.tcp_no_metrics_save = 0
+net.ipv4.tcp_ecn = 1
 net.ipv4.tcp_ecn_fallback = 1
 net.ipv4.tcp_frto = 0
-
 net.ipv6.conf.all.accept_redirects = 0
 net.ipv6.conf.default.accept_redirects = 0
-vm.swappiness = 1
-#net.ipv4.ip_unprivileged_port_start = 0
-vm.overcommit_memory = 1
-#vm.nr_hugepages=1280
-kernel.pid_max=64000
 net.ipv4.neigh.default.gc_thresh3=8192
 net.ipv4.neigh.default.gc_thresh2=4096
 net.ipv4.neigh.default.gc_thresh1=2048
 net.ipv6.neigh.default.gc_thresh3=8192
 net.ipv6.neigh.default.gc_thresh2=4096
 net.ipv6.neigh.default.gc_thresh1=2048
-net.ipv4.tcp_max_syn_backlog = 262144
+net.ipv4.tcp_orphan_retries = 1
+net.ipv4.tcp_retries2 = 5
+vm.swappiness = 1
+vm.overcommit_memory = 1
+kernel.pid_max=64000
 net.netfilter.nf_conntrack_max = 262144
 net.nf_conntrack_max = 262144
+## Enable bbr
+net.core.default_qdisc = fq
+net.ipv4.tcp_congestion_control = bbr
+net.ipv4.tcp_low_latency = 1
 EOF
   sysctl -p
   sysctl --system
   echo madvise >/sys/kernel/mm/transparent_hugepage/enabled
-
-  sed -i '/DefaultTimeoutStartSec/d' /etc/systemd/system.conf
-  sed -i '/DefaultTimeoutStopSec/d' /etc/systemd/system.conf
-  sed -i '/DefaultRestartSec/d' /etc/systemd/system.conf
-  sed -i '/DefaultLimitCORE/d' /etc/systemd/system.conf
-  sed -i '/DefaultLimitNOFILE/d' /etc/systemd/system.conf
-  sed -i '/DefaultLimitNPROC/d' /etc/systemd/system.conf
 
   cat >'/etc/systemd/system.conf' <<EOF
 [Manager]
@@ -990,39 +971,62 @@ EOF
 DefaultTimeoutStopSec=30s
 #DefaultRestartSec=100ms
 DefaultLimitCORE=infinity
-DefaultLimitNOFILE=65535
-DefaultLimitNPROC=65535
+DefaultLimitNOFILE=infinity
+DefaultLimitNPROC=infinity
+DefaultTasksMax=infinity
 EOF
 
-  sed -i '/soft nofile/d' /etc/security/limits.conf
-  sed -i '/hard nofile/d' /etc/security/limits.conf
-  sed -i '/soft nproc/d' /etc/security/limits.conf
-  sed -i '/hard nproc/d' /etc/security/limits.conf
-  cat >'/etc/security/limits.conf' <<EOF
-* soft nofile 65535
-* hard nofile 65535
+  cat > '/etc/security/limits.conf' << EOF
+root     soft   nofile    1000000
+root     hard   nofile    1000000
+root     soft   nproc     unlimited
+root     hard   nproc     unlimited
+root     soft   core      unlimited
+root     hard   core      unlimited
+root     hard   memlock   unlimited
+root     soft   memlock   unlimited
+*     soft   nofile    1000000
+*     hard   nofile    1000000
+*     soft   nproc     unlimited
+*     hard   nproc     unlimited
+*     soft   core      unlimited
+*     hard   core      unlimited
+*     hard   memlock   unlimited
+*     soft   memlock   unlimited
 EOF
   if grep -q "ulimit" /etc/profile; then
     :
   else
     sed -i '/ulimit -SHn/d' /etc/profile
     sed -i '/ulimit -SHu/d' /etc/profile
-    echo "ulimit -SHn 65535" >>/etc/profile
+    echo "ulimit -SHn 1000000" >> /etc/profile
   fi
   if grep -q "pam_limits.so" /etc/pam.d/common-session; then
     :
   else
     sed -i '/required pam_limits.so/d' /etc/pam.d/common-session
-    echo "session required pam_limits.so" >>/etc/pam.d/common-session
+    echo "session required pam_limits.so" >> /etc/pam.d/common-session
   fi
   systemctl daemon-reload
   echo -e "${Info}johnrosen1优化方案应用结束，可能需要重启！"
 }
 
+optimizing_ddcc() {
+sed -i '/net.ipv4.conf.all.rp_filter/d' /etc/sysctl.d/99-sysctl.conf
+sed -i '/net.ipv4.tcp_syncookies/d' /etc/sysctl.d/99-sysctl.conf
+sed -i '/net.ipv4.tcp_max_syn_backlog/d' /etc/sysctl.d/99-sysctl.conf
+
+echo "net.ipv4.conf.all.rp_filter = 1" >> /etc/sysctl.d/99-sysctl.conf
+echo "net.ipv4.tcp_syncookies = 1" >> /etc/sysctl.d/99-sysctl.conf
+echo "net.ipv4.tcp_max_syn_backlog = 1024" >> /etc/sysctl.d/99-sysctl.conf
+sysctl -p
+sysctl --system
+}
+
 #更新脚本
 Update_Shell() {
   echo -e "当前版本为 [ ${sh_ver} ]，开始检测最新版本..."
-  sh_new_ver=$(wget -qO- "https://git.io/JYxKU" | grep 'sh_ver="' | awk -F "=" '{print $NF}' | sed 's/\"//g' | head -1)
+  sh_new_ver=$(wget -qO- "https://github.com/ylx2016/Linux-NetSpeed/raw/master/tcpx.sh" | grep 'sh_ver="' | awk -F "=" '{print $NF}' | sed 's/\"//g' | head -1)
   [[ -z ${sh_new_ver} ]] && echo -e "${Error} 检测最新版本失败 !" && start_menu
   if [ ${sh_new_ver} != ${sh_ver} ]; then
     echo -e "发现新版本[ ${sh_new_ver} ]，是否更新？[Y/n]"
@@ -1043,7 +1047,7 @@ Update_Shell() {
 #切换到卸载内核版本
 gototcp() {
   clear
-  wget -O tcp.sh "https://git.io/coolspeeda" && chmod +x tcp.sh && ./tcp.sh
+  wget -O tcp.sh "https://github.com/ylx2016/Linux-NetSpeed/raw/master/tcp.sh" && chmod +x tcp.sh && ./tcp.sh
 }
 
 #切换到秋水逸冰BBR安装脚本
@@ -1055,7 +1059,10 @@ gototeddysun_bbr() {
 #切换到一键DD安装系统脚本 新手勿入
 gotodd() {
   clear
-  wget -qO ~/Network-Reinstall-System-Modify.sh 'https://github.com/ylx2016/reinstall/raw/master/Network-Reinstall-System-Modify.sh' && chmod a+x ~/Network-Reinstall-System-Modify.sh && bash ~/Network-Reinstall-System-Modify.sh -UI_Options
+  echo DD使用git.beta.gs的脚本，知悉
+  sleep 1.5
+  wget -O NewReinstall.sh https://github.com/fcurrk/reinstall/raw/master/NewReinstall.sh && chmod a+x NewReinstall.sh && bash NewReinstall.sh
+  #wget -qO ~/Network-Reinstall-System-Modify.sh 'https://github.com/ylx2016/reinstall/raw/master/Network-Reinstall-System-Modify.sh' && chmod a+x ~/Network-Reinstall-System-Modify.sh && bash ~/Network-Reinstall-System-Modify.sh -UI_Options
 }
 
 #禁用IPv6
@@ -1208,6 +1215,9 @@ start_menu() {
   25)
     remove_all
     ;;
+  26)
+    optimizing_ddcc
+    ;;	
   51)
     BBR_grub
     ;;
