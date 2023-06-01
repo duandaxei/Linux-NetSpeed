@@ -4,7 +4,7 @@ export PATH
 #=================================================
 #	System Required: CentOS 7/8,Debian/ubuntu,oraclelinux
 #	Description: BBR+BBRplus+Lotserver
-#	Version: 100.0.1.20
+#	Version: 100.0.1.21
 #	Author: 千影,cx9208,YLX
 #	更新内容及反馈:  https://blog.ylx.me/archives/783.html
 #=================================================
@@ -15,11 +15,12 @@ export PATH
 # SKYBLUE='\033[0;36m'
 # PLAIN='\033[0m'
 
-sh_ver="100.0.1.20"
+sh_ver="100.0.1.21"
 github="raw.githubusercontent.com/ylx2016/Linux-NetSpeed/master"
 
 imgurl=""
 headurl=""
+github_network=1
 
 Green_font_prefix="\033[32m"
 Red_font_prefix="\033[31m"
@@ -33,33 +34,34 @@ if [ -f "/etc/sysctl.d/bbr.conf" ]; then
 fi
 
 # 检查当前用户是否为 root 用户
-if [ "$EUID" -ne 0 ]
-  then echo "请使用 root 用户身份运行此脚本"
+if [ "$EUID" -ne 0 ]; then
+  echo "请使用 root 用户身份运行此脚本"
   exit
 fi
 
-#检查github网络
+# 检查github网络
 check_github() {
-  # 检测 raw.githubusercontent.com 的可访问性
-  if ! curl --head --silent --fail "https://raw.githubusercontent.com" >/dev/null; then
-    echo "无法访问 https://raw.githubusercontent.com 请检查网络或者本地DNS"
-    exit 1
-  fi
+  # 检测域名的可访问性函数
+  check_domain() {
+    local domain="$1"
+    if ! curl --head --silent --fail "$domain" >/dev/null; then
+      echo -e "${Error}无法访问 $domain，请检查网络或者本地DNS"
+      github_network=0
+    fi
+  }
 
-  # 检测 api.github.com 的可访问性
-  if ! curl --head --silent --fail "https://api.github.com" >/dev/null; then
-    echo "无法访问 https://api.github.com 请检查网络或者本地DNS"
-    exit 1
-  fi
+  # 检测所有域名的可访问性
+  check_domain "https://raw.githubusercontent.com"
+  check_domain "https://api.github.com"
+  check_domain "https://github.com"
 
-  # 检测 github.com 的可访问性
-  if ! curl --head --silent --fail "https://github.com" >/dev/null; then
-    echo "无法访问 https://github.com 请检查网络或者本地DNS"
-    exit 1
+  if [ "$github_network" -eq 0 ]; then
+    echo -e "${Error}github网络访问受限，将影响内核的安装以及脚本的检查更新，5秒后继续运行脚本"
+    sleep 5
+  else
+    # 所有域名均可访问，打印成功提示
+    echo "${Green_font_prefix}github可访问${Font_color_suffix}，继续执行脚本..."
   fi
-
-  # 所有域名均可访问，打印成功提示
-  echo "github可访问，继续执行脚本..."
 }
 
 #检查连接
@@ -100,7 +102,7 @@ installbbr() {
         #github_ver=$(curl -s 'https://api.github.com/repos/ylx2016/kernel/releases' | grep ${github_tag} | head -n 1 | awk -F '"' '{print $4}' | awk -F '[/]' '{print $8}' | awk -F '[_]' '{print $3}')
         github_tag=$(curl -s 'https://api.github.com/repos/ylx2016/kernel/releases' | grep 'Centos_Kernel' | grep '_latest_bbr_' | head -n 1 | awk -F '"' '{print $4}' | awk -F '[/]' '{print $8}')
         github_ver=$(curl -s 'https://api.github.com/repos/ylx2016/kernel/releases' | grep ${github_tag} | grep 'rpm' | grep 'headers' | awk -F '"' '{print $4}' | awk -F '[/]' '{print $9}' | awk -F '[-]' '{print $3}')
-        echo -e "获取的版本号为:${github_ver}"
+        echo -e "获取的版本号为:${Green_font_prefix}${github_ver}${Font_color_suffix}"
         kernel_version=$github_ver
         detele_kernel_head
         headurl=$(curl -s 'https://api.github.com/repos/ylx2016/kernel/releases' | grep ${github_tag} | grep 'rpm' | grep 'headers' | awk -F '"' '{print $4}')
@@ -128,7 +130,7 @@ installbbr() {
       echo -e "如果下载地址出错，可能当前正在更新，超过半天还是出错请反馈，大陆自行解决污染问题"
       github_tag=$(curl -s 'https://api.github.com/repos/ylx2016/kernel/releases' | grep 'Debian_Kernel' | grep '_latest_bbr_' | head -n 1 | awk -F '"' '{print $4}' | awk -F '[/]' '{print $8}')
       github_ver=$(curl -s 'https://api.github.com/repos/ylx2016/kernel/releases' | grep ${github_tag} | grep 'deb' | grep 'headers' | awk -F '"' '{print $4}' | awk -F '[/]' '{print $9}' | awk -F '[-]' '{print $3}' | awk -F '[_]' '{print $1}')
-      echo -e "获取的版本号为:${github_ver}"
+      echo -e "获取的版本号为:${Green_font_prefix}${github_ver}${Font_color_suffix}"
       kernel_version=$github_ver
       detele_kernel_head
       headurl=$(curl -s 'https://api.github.com/repos/ylx2016/kernel/releases' | grep ${github_tag} | grep 'deb' | grep 'headers' | awk -F '"' '{print $4}')
@@ -150,7 +152,7 @@ installbbr() {
       echo -e "如果下载地址出错，可能当前正在更新，超过半天还是出错请反馈，大陆自行解决污染问题"
       github_tag=$(curl -s 'https://api.github.com/repos/ylx2016/kernel/releases' | grep 'Debian_Kernel' | grep '_arm64_' | grep '_bbr_' | head -n 1 | awk -F '"' '{print $4}' | awk -F '[/]' '{print $8}')
       github_ver=$(curl -s 'https://api.github.com/repos/ylx2016/kernel/releases' | grep ${github_tag} | grep 'deb' | grep 'headers' | awk -F '"' '{print $4}' | awk -F '[/]' '{print $9}' | awk -F '[-]' '{print $3}' | awk -F '[_]' '{print $1}')
-      echo -e "获取的版本号为:${github_ver}"
+      echo -e "获取的版本号为:${Green_font_prefix}${github_ver}${Font_color_suffix}"
       kernel_version=$github_ver
       detele_kernel_head
       headurl=$(curl -s 'https://api.github.com/repos/ylx2016/kernel/releases' | grep ${github_tag} | grep 'deb' | grep 'headers' | awk -F '"' '{print $4}')
@@ -363,7 +365,7 @@ installxanmod() {
         echo -e "如果下载地址出错，可能当前正在更新，超过半天还是出错请反馈，大陆自行解决污染问题"
         github_tag=$(curl -s 'https://api.github.com/repos/ylx2016/kernel/releases' | grep 'Centos_Kernel' | grep '_lts_latest_' | grep 'xanmod' | head -n 1 | awk -F '"' '{print $4}' | awk -F '[/]' '{print $8}')
         github_ver=$(curl -s 'https://api.github.com/repos/ylx2016/kernel/releases' | grep ${github_tag} | grep 'rpm' | grep 'headers' | awk -F '"' '{print $4}' | awk -F '[/]' '{print $9}' | awk -F '[-]' '{print $3}')
-        echo -e "获取的版本号为:${github_ver}"
+        echo -e "获取的版本号为:${Green_font_prefix}${github_ver}${Font_color_suffix}"
         kernel_version=$github_ver
         detele_kernel_head
         headurl=$(curl -s 'https://api.github.com/repos/ylx2016/kernel/releases' | grep ${github_tag} | grep 'rpm' | grep 'headers' | awk -F '"' '{print $4}')
@@ -386,7 +388,7 @@ installxanmod() {
       echo -e "如果下载地址出错，可能当前正在更新，超过半天还是出错请反馈，大陆自行解决污染问题"
       github_tag=$(curl -s 'https://api.github.com/repos/ylx2016/kernel/releases' | grep 'Centos_Kernel' | grep '_lts_C8_latest_' | grep 'xanmod' | head -n 1 | awk -F '"' '{print $4}' | awk -F '[/]' '{print $8}')
       github_ver=$(curl -s 'https://api.github.com/repos/ylx2016/kernel/releases' | grep ${github_tag} | grep 'rpm' | grep 'headers' | awk -F '"' '{print $4}' | awk -F '[/]' '{print $9}' | awk -F '[-]' '{print $3}')
-      echo -e "获取的版本号为:${github_ver}"
+      echo -e "获取的版本号为:${Green_font_prefix}${github_ver}${Font_color_suffix}"
       kernel_version=$github_ver
       detele_kernel_head
       headurl=$(curl -s 'https://api.github.com/repos/ylx2016/kernel/releases' | grep ${github_tag} | grep 'rpm' | grep 'headers' | awk -F '"' '{print $4}')
@@ -486,7 +488,7 @@ installbbrplusnew() {
       if [[ ${bit} == "x86_64" ]]; then
         #github_tag=$(curl -s 'https://api.github.com/repos/ylx2016/kernel/releases' | grep 'Centos_Kernel' | grep '_latest_bbrplus_' | head -n 1 | awk -F '"' '{print $4}' | awk -F '[/]' '{print $8}')
         #github_ver=$(curl -s 'https://api.github.com/repos/ylx2016/kernel/releases' | grep ${github_tag} | grep 'rpm' | grep 'headers' | awk -F '"' '{print $4}' | awk -F '[/]' '{print $9}' | awk -F '[-]' '{print $3}' | awk -F '[_]' '{print $1}')
-        #echo -e "获取的版本号为:${github_ver}"
+        #echo -e "获取的版本号为:${Green_font_prefix}${github_ver}${Font_color_suffix}"
         kernel_version=${github_ver_plus_num}-bbrplus
         detele_kernel_head
         headurl=$(curl -s 'https://api.github.com/repos/UJX6N/bbrplus-6.x_stable/releases' | grep ${github_ver_plus} | grep 'rpm' | grep 'headers' | grep 'el7' | awk -F '"' '{print $4}' | grep 'http')
@@ -510,7 +512,7 @@ installbbrplusnew() {
       if [[ ${bit} == "x86_64" ]]; then
         #github_tag=$(curl -s 'https://api.github.com/repos/ylx2016/kernel/releases' | grep 'Centos_Kernel' | grep '_latest_bbrplus_' | head -n 1 | awk -F '"' '{print $4}' | awk -F '[/]' '{print $8}')
         #github_ver=$(curl -s 'https://api.github.com/repos/ylx2016/kernel/releases' | grep ${github_tag} | grep 'rpm' | grep 'headers' | awk -F '"' '{print $4}' | awk -F '[/]' '{print $9}' | awk -F '[-]' '{print $3}' | awk -F '[_]' '{print $1}')
-        #echo -e "获取的版本号为:${github_ver}"
+        #echo -e "获取的版本号为:${Green_font_prefix}${github_ver}${Font_color_suffix}"
         kernel_version=${github_ver_plus_num}-bbrplus
         detele_kernel_head
         headurl=$(curl -s 'https://api.github.com/repos/UJX6N/bbrplus-6.x_stable/releases' | grep ${github_ver_plus} | grep 'rpm' | grep 'headers' | grep 'el8.x86_64' | grep 'https' | awk -F '"' '{print $4}' | grep 'http')
@@ -534,7 +536,7 @@ installbbrplusnew() {
     if [[ ${bit} == "x86_64" ]]; then
       #github_tag=$(curl -s 'https://api.github.com/repos/ylx2016/kernel/releases' | grep 'Ubuntu_Kernel' | grep '_latest_bbrplus_' | head -n 1 | awk -F '"' '{print $4}' | awk -F '[/]' '{print $8}')
       #github_ver=$(curl -s 'http s://api.github.com/repos/ylx2016/kernel/releases' | grep ${github_tag} | grep 'deb' | grep 'headers' | awk -F '"' '{print $4}' | awk -F '[/]' '{print $9}' | awk -F '[-]' '{print $3}' | awk -F '[_]' '{print $1}')
-      #echo -e "获取的版本号为:${github_ver}"
+      #echo -e "获取的版本号为:${Green_font_prefix}${github_ver}${Font_color_suffix}"
       kernel_version=${github_ver_plus_num}-bbrplus
       detele_kernel_head
       headurl=$(curl -s 'https://api.github.com/repos/UJX6N/bbrplus-6.x_stable/releases' | grep ${github_ver_plus} | grep 'https' | grep 'amd64.deb' | grep 'headers' | awk -F '"' '{print $4}' | grep 'http')
@@ -553,7 +555,7 @@ installbbrplusnew() {
     elif [[ ${bit} == "aarch64" ]]; then
       #github_tag=$(curl -s 'https://api.github.com/repos/ylx2016/kernel/releases' | grep 'Ubuntu_Kernel' | grep '_latest_bbrplus_' | head -n 1 | awk -F '"' '{print $4}' | awk -F '[/]' '{print $8}')
       #github_ver=$(curl -s 'http s://api.github.com/repos/ylx2016/kernel/releases' | grep ${github_tag} | grep 'deb' | grep 'headers' | awk -F '"' '{print $4}' | awk -F '[/]' '{print $9}' | awk -F '[-]' '{print $3}' | awk -F '[_]' '{print $1}')
-      #echo -e "获取的版本号为:${github_ver}"
+      #echo -e "获取的版本号为:${Green_font_prefix}${github_ver}${Font_color_suffix}"
       kernel_version=${github_ver_plus_num}-bbrplus
       detele_kernel_head
       headurl=$(curl -s 'https://api.github.com/repos/UJX6N/bbrplus-6.x_stable/releases' | grep ${github_ver_plus} | grep 'https' | grep 'arm64.deb' | grep 'headers' | awk -F '"' '{print $4}')
@@ -1061,7 +1063,7 @@ EOF
     echo "session required pam_limits.so" >>/etc/pam.d/common-session
   fi
   systemctl daemon-reload
-  echo -e "${Info}johnrosen1优化方案应用结束，可能需要重启！"
+  echo -e "${Info}优化方案2应用结束，可能需要重启！"
 }
 
 optimizing_ddcc() {
@@ -1078,15 +1080,18 @@ optimizing_ddcc() {
 
 #更新脚本
 Update_Shell() {
-  local shell_file="$(readlink -f "$0")"
+  local shell_file
+  shell_file="$(readlink -f "$0")"
   local shell_url="https://raw.githubusercontent.com/ylx2016/Linux-NetSpeed/master/tcpx.sh"
 
   # 下载最新版本的脚本
   wget -O "/tmp/tcpx.sh" "$shell_url" &>/dev/null
 
   # 比较本地和远程脚本的 md5 值
-  local md5_local="$(md5sum "$shell_file" | awk '{print $1}')"
-  local md5_remote="$(md5sum /tmp/tcpx.sh | awk '{print $1}')"
+  local md5_local
+  local md5_remote
+  md5_local="$(md5sum "$shell_file" | awk '{print $1}')"
+  md5_remote="$(md5sum /tmp/tcpx.sh | awk '{print $1}')"
 
   if [ "$md5_local" != "$md5_remote" ]; then
     # 替换本地脚本文件
@@ -1841,12 +1846,12 @@ check_sys_official_bbr() {
 
     apt update
     if [[ ${os_arch} == "x86_64" ]]; then
-      apt -t $(lsb_release -cs)-backports install \
+      apt -t "$(lsb_release -cs)-backports" install \
         linux-image-amd64 \
         linux-headers-amd64 \
         -y
     elif [[ ${os_arch} =~ ^(arm|aarch64)$ ]]; then
-      apt -t $(lsb_release -cs)-backports install \
+      apt -t "$(lsb_release -cs)-backports" install \
         linux-image-arm64 \
         linux-headers-arm64 \
         -y
