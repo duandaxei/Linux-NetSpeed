@@ -4,7 +4,7 @@ export PATH
 #=================================================
 #	System Required: CentOS 7/8,Debian/ubuntu,oraclelinux
 #	Description: BBR+BBRplus+Lotserver
-#	Version: 100.0.2.4
+#	Version: 100.0.2.5
 #	Author: 千影,cx9208,YLX
 #	更新内容及反馈:  https://blog.ylx.me/archives/783.html
 #=================================================
@@ -15,7 +15,7 @@ export PATH
 # SKYBLUE='\033[0;36m'
 # PLAIN='\033[0m'
 
-sh_ver="100.0.2.4"
+sh_ver="100.0.2.5"
 github="raw.githubusercontent.com/ylx2016/Linux-NetSpeed/master"
 
 imgurl=""
@@ -190,6 +190,37 @@ check_empty() {
     echo "$var_value 是空值，退出！"
     exit 1
   fi
+}
+
+#检查磁盘空间
+check_disk_space() {
+    # 检查是否存在 bc 命令
+    if ! command -v bc &> /dev/null; then
+        echo "安装 bc 命令..."
+        # 检查系统类型并安装相应的 bc 包
+        if [ -f /etc/redhat-release ]; then
+            yum install -y bc
+        elif [ -f /etc/debian_version ]; then
+            apt-get update
+            apt-get install -y bc
+        else
+            echo "无法确定系统类型，请手动安装 bc 命令。"
+            return 1
+        fi
+    fi
+
+    # 获取当前磁盘剩余空间
+    available_space=$(df -h / | awk 'NR==2 {print $4}')
+
+    # 移除单位字符，例如"GB"，并将剩余空间转换为数字
+    available_space=$(echo $available_space | sed 's/G//')
+
+    # 如果剩余空间小于等于0，则输出警告信息
+    if [ $(echo "$available_space <= 0" | bc) -eq 1 ]; then
+        echo "警告：磁盘空间已用尽，请勿重启，先清理空间。建议先卸载刚才安装的内核来释放空间，仅供参考。"
+    else
+        echo "当前磁盘剩余空间：$available_space GB"
+    fi
 }
 
 #安装BBR内核
@@ -1498,6 +1529,7 @@ BBR_grub() {
     fi
     #exit 1
   fi
+ check_disk_space
 }
 
 #简单的检查内核
