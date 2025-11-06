@@ -5,7 +5,7 @@ export PATH
 #=================================================
 #	System Required: CentOS 7/8,Debian/ubuntu,oraclelinux
 #	Description: BBR+BBRplus+Lotserver
-#	Version: 100.0.4.13
+#	Version: 100.0.4.15
 #	Author: 千影,cx9208,YLX
 #	更新内容及反馈:  https://blog.ylx.me/archives/783.html
 #=================================================
@@ -16,7 +16,7 @@ export PATH
 # SKYBLUE='\033[0;36m'
 # PLAIN='\033[0m'
 
-sh_ver="100.0.4.13"
+sh_ver="100.0.4.15"
 github="raw.githubusercontent.com/ylx2016/Linux-NetSpeed/master"
 
 imgurl=""
@@ -330,16 +330,20 @@ err() {
 
 while [ $# -gt 0 ]; do
 	case $1 in
-	op)
+	op0)
 		optimizing_system_old # 调用函数
 		exit
 		;;
-	op2)
+	op1)
 		optimizing_system_johnrosen1 # 调用函数
 		exit
 		;;
-	op3)
+	op2)
 		update_sysctl_interactive # 调用函数
+		exit
+		;;
+	op3)
+		etit_sysctl_interactive # 调用函数
 		exit
 		;;
 	*)
@@ -1355,8 +1359,8 @@ net.ipv6.conf.default.accept_ra = 2" >>/etc/sysctl.d/99-sysctl.conf
 
 #开始菜单
 start_menu() {
-    clear
-    echo && echo -e " TCP加速 一键安装管理脚本 ${Red_font_prefix}[v${sh_ver}] 不卸内核${Font_color_suffix} from blog.ylx.me 母鸡慎用
+	clear
+	echo && echo -e " TCP加速 一键安装管理脚本 ${Red_font_prefix}[v${sh_ver}] 不卸内核${Font_color_suffix} from blog.ylx.me 母鸡慎用
  ${Green_font_prefix}0.${Font_color_suffix} 升级脚本
  ${Green_font_prefix}9.${Font_color_suffix} 切换到卸载内核版本        ${Green_font_prefix}10.${Font_color_suffix} 切换到一键DD系统脚本
  ${Green_font_prefix}60.${Font_color_suffix} 切换到检查当前IP质量/媒体解锁/邮箱通信脚本
@@ -1377,142 +1381,145 @@ start_menu() {
  ${Green_font_prefix}17.${Font_color_suffix} 开启ECN                  ${Green_font_prefix}18.${Font_color_suffix} 关闭ECN
  ${Green_font_prefix}21.${Font_color_suffix} 系统配置优化旧           ${Green_font_prefix}22.${Font_color_suffix} 系统配置优化新
  ${Green_font_prefix}23.${Font_color_suffix} 禁用IPv6                 ${Green_font_prefix}24.${Font_color_suffix} 开启IPv6
- ${Green_font_prefix}61.${Font_color_suffix} 手动提交合并内核参数
+ ${Green_font_prefix}61.${Font_color_suffix} 手动提交合并内核参数     ${Green_font_prefix}62.${Font_color_suffix} 手动编辑内核参数
  ———————————————————————————— 内核管理 —————————————————————————————
  ${Green_font_prefix}51.${Font_color_suffix} 查看排序内核             ${Green_font_prefix}52.${Font_color_suffix} 删除保留指定内核
  ${Green_font_prefix}25.${Font_color_suffix} 卸载全部加速             ${Green_font_prefix}99.${Font_color_suffix} 退出脚本 
 ————————————————————————————————————————————————————————————————" &&
-        check_status
-    get_system_info
-    echo -e " 信息： ${Font_color_suffix}$opsy ${Green_font_prefix}$virtual${Font_color_suffix} $arch ${Green_font_prefix}$kern${Font_color_suffix} "
-    if [[ ${kernel_status} == "noinstall" ]]; then
-        echo -e " 状态: ${Green_font_prefix}未安装${Font_color_suffix} 加速内核 ${Red_font_prefix}请先安装内核${Font_color_suffix}"
-    else
-        echo -e " 状态: ${Green_font_prefix}已安装${Font_color_suffix} ${Red_font_prefix}${kernel_status}${Font_color_suffix} 加速内核 , ${Green_font_prefix}${run_status}${Font_color_suffix} ${Red_font_prefix}${brutal}${Font_color_suffix}"
+		check_status
+	get_system_info
+	echo -e " 信息： ${Font_color_suffix}$opsy ${Green_font_prefix}$virtual${Font_color_suffix} $arch ${Green_font_prefix}$kern${Font_color_suffix} "
+	if [[ ${kernel_status} == "noinstall" ]]; then
+		echo -e " 状态: ${Green_font_prefix}未安装${Font_color_suffix} 加速内核 ${Red_font_prefix}请先安装内核${Font_color_suffix}"
+	else
+		echo -e " 状态: ${Green_font_prefix}已安装${Font_color_suffix} ${Red_font_prefix}${kernel_status}${Font_color_suffix} 加速内核 , ${Green_font_prefix}${run_status}${Font_color_suffix} ${Red_font_prefix}${brutal}${Font_color_suffix}"
 
-    fi
-    echo -e " 拥塞控制算法:: ${Green_font_prefix}${net_congestion_control}${Font_color_suffix} 队列算法: ${Green_font_prefix}${net_qdisc}${Font_color_suffix} 内核headers：${Green_font_prefix}${headers_status}${Font_color_suffix}"
+	fi
+	echo -e " 拥塞控制算法:: ${Green_font_prefix}${net_congestion_control}${Font_color_suffix} 队列算法: ${Green_font_prefix}${net_qdisc}${Font_color_suffix} 内核headers：${Green_font_prefix}${headers_status}${Font_color_suffix}"
 
-    read -p " 请输入数字 :" num
-    case "$num" in
-    0)
-        Update_Shell
-        ;;
-    1)
-        check_sys_bbr
-        ;;
-    2)
-        check_sys_bbrplus
-        ;;
-    3)
-        check_sys_Lotsever
-        ;;
-    5)
-        check_sys_bbrplusnew
-        ;;
-    7)
-        check_sys_official_zen
-        ;;
-    8)
-        check_sys_cloud
-        ;;
-    30)
-        check_sys_official
-        ;;
-    31)
-        check_sys_official_bbr
-        ;;
-    32)
-        check_sys_official_xanmod_main
-        ;;
-    33)
-        check_sys_official_xanmod_lts
-        ;;
-    36)
-        check_sys_official_xanmod_edge
-        ;;
-    37)
-        check_sys_official_xanmod_rt
-        ;;
-    9)
-        gototcp
-        ;;
-    10)
-        gotodd
-        ;;
-    60)
-        gotoipcheck
-        ;;
-    11)
-        startbbrfq
-        ;;
-    12)
-        startbbrfqpie
-        ;;
-    13)
-        startbbrcake
-        ;;
-    14)
-        startbbr2fq
-        ;;
-    15)
-        startbbr2fqpie
-        ;;
-    16)
-        startbbr2cake
-        ;;
-    17)
-        startecn
-        ;;
-    18)
-        closeecn
-        ;;
-    19)
-        startbbrplus
-        ;;
-    20)
-        startlotserver
-        ;;
-    21)
-        optimizing_system_old
-        ;;
-    22)
-        optimizing_system_johnrosen1
-        ;;
-    23)
-        closeipv6
-        ;;
-    24)
-        openipv6
-        ;;
-    25)
-        remove_all
-        ;;
-    26)
-        optimizing_ddcc
-        ;;
-    28)
-        startbrutal
-        ;;
-    51)
-        BBR_grub
-        ;;
-    52)
-        detele_kernel_custom
-        ;;
-    61)
-        update_sysctl_interactive
-        ;;
-    99)
-        exit 1
-        ;;
-    *)
-        clear
-        echo -e "${Error}:请输入正确数字 [0-99]"
-        sleep 5s
-        start_menu
-        ;;
-    esac
+	read -p " 请输入数字 :" num
+	case "$num" in
+	0)
+		Update_Shell
+		;;
+	1)
+		check_sys_bbr
+		;;
+	2)
+		check_sys_bbrplus
+		;;
+	3)
+		check_sys_Lotsever
+		;;
+	5)
+		check_sys_bbrplusnew
+		;;
+	7)
+		check_sys_official_zen
+		;;
+	8)
+		check_sys_cloud
+		;;
+	30)
+		check_sys_official
+		;;
+	31)
+		check_sys_official_bbr
+		;;
+	32)
+		check_sys_official_xanmod_main
+		;;
+	33)
+		check_sys_official_xanmod_lts
+		;;
+	36)
+		check_sys_official_xanmod_edge
+		;;
+	37)
+		check_sys_official_xanmod_rt
+		;;
+	9)
+		gototcp
+		;;
+	10)
+		gotodd
+		;;
+	60)
+		gotoipcheck
+		;;
+	11)
+		startbbrfq
+		;;
+	12)
+		startbbrfqpie
+		;;
+	13)
+		startbbrcake
+		;;
+	14)
+		startbbr2fq
+		;;
+	15)
+		startbbr2fqpie
+		;;
+	16)
+		startbbr2cake
+		;;
+	17)
+		startecn
+		;;
+	18)
+		closeecn
+		;;
+	19)
+		startbbrplus
+		;;
+	20)
+		startlotserver
+		;;
+	21)
+		optimizing_system_old
+		;;
+	22)
+		optimizing_system_johnrosen1
+		;;
+	23)
+		closeipv6
+		;;
+	24)
+		openipv6
+		;;
+	25)
+		remove_all
+		;;
+	26)
+		optimizing_ddcc
+		;;
+	28)
+		startbrutal
+		;;
+	51)
+		BBR_grub
+		;;
+	52)
+		detele_kernel_custom
+		;;
+	61)
+		update_sysctl_interactive
+		;;
+	62)
+		edit_sysctl_interactive
+		;;
+	99)
+		exit 1
+		;;
+	*)
+		clear
+		echo -e "${Error}:请输入正确数字 [0-99]"
+		sleep 5s
+		start_menu
+		;;
+	esac
 }
 #############内核管理组件#############
 
@@ -1631,7 +1638,7 @@ update_sysctl_interactive() {
 	log_info "请输入或粘贴您要设置的 sysctl 参数 (格式: key = value)。"
 	log_info "可参考TCP迷之调参，https://omnitt.com/"
 	log_info "注释行(以 # 或 ; 开头)和空行将被忽略。"
-	log_info "最后一行请以空行结束"
+	log_info "最后一行请以空行结束 可手动回车加一行空行"
 	log_info "输入完成后，请按 Ctrl+D 结束输入。"
 
 	readarray -t user_input
@@ -1718,7 +1725,7 @@ update_sysctl_interactive() {
 	trap - RETURN
 
 	# 7. 应用配置并进行错误处理
-	log_info "正在应用新的 sysctl 设置..."
+	log_info "正在应用新�� sysctl 设置..."
 	if apply_output=$(sysctl -p "$CONF_FILE" 2>&1); then
 		log_info "Sysctl 设置已成功应用。"
 		echo "--- 应用输出 ---"
@@ -1751,6 +1758,82 @@ update_sysctl_interactive() {
 	fi
 
 	return 0
+}
+
+edit_sysctl_interactive() {
+	local target_file="/etc/sysctl.d/99-sysctl.conf"
+	local editor_cmd=""
+
+	# --- 1. 检查文件是否存在 ---
+	if [ ! -f "$target_file" ]; then
+		echo "文件 $target_file 不存在。"
+		# (Y/n) 格式，n/N 以外的任何输入（包括回车）都将继续
+		read -r -p "您想现在创建并编辑它吗？ (Y/n): " create_choice
+
+		case "$create_choice" in
+		[nN])
+			echo "操作已取消。"
+			return 0 # 0 表示成功（用户主动取消）
+			;;
+		*)
+			echo "好的，准备创建并打开编辑器..."
+			# 注意：我们不需要在这里 'touch' 文件。
+			# 'sudo' 配合编辑器（如 nano 或 vi）在保存时会自动创建文件。
+			;;
+		esac
+	fi
+
+	# --- 2. 检查并选择编辑器 ---
+	if command -v nano >/dev/null; then
+		# 优先使用 nano
+		editor_cmd="nano"
+	else
+		# nano 不存在，提示安装
+		echo "首选编辑器 'nano' 未安装。"
+		# (Y/n) 格式，n/N 以外的任何输入（包括回车）都将继续
+		read -r -p "您想现在安装 'nano' 吗？ (Y/n): " install_choice
+
+		case "$install_choice" in
+		[nN])
+			# 用户不安装，回退到 vi
+			echo "好的，将使用 'vi' 编辑器。"
+			echo "提示：'vi' 启动后，按 'i' 键进入插入模式，'Esc' 键退出插入模式，"
+			echo "   然后输入 ':wq' 保存并退出，或 ':q!' 不保存退出。"
+			editor_cmd="vi"
+			;;
+		*)
+			# 这是一个安全的设计：函数不应该自己执行安装。
+			# 它应该指导用户，然后退出，让用户安装后重试。
+			echo "请在您的终端中运行:"
+			echo "  sudo apt install nano  (适用于 Debian/Ubuntu)"
+			echo "  sudo dnf install nano  (适用于 Fedora/RHEL 8+)"
+			echo "  sudo yum install nano  (适用于 CentOS 7)"
+			echo "安装完成后，请重新运行此函数。"
+			echo "操作已取消。"
+			return 1 # 1 表示一个非0的退出码，表示未完成
+			;;
+		esac
+	fi
+
+	# --- 3. 执行编辑 ---
+	echo "正在使用 $editor_cmd 打开 $target_file..."
+	echo "请注意：编辑系统文件需要管理员权限，您可能需要输入密码。"
+
+	# 使用 sudo 来运行编辑器，以便有权限写入 /etc/sysctl.d/ 目录
+	if ! sudo "$editor_cmd" "$target_file"; then
+		echo "编辑器 '$editor_cmd' 启动失败或异常退出。"
+		echo "请检查您的 sudo 权限或编辑器是否正确安装。"
+		return 1
+	fi
+
+	# --- 4. (修改) 默认直接应用 ---
+	echo ""
+	echo "编辑完成。"
+	echo "正在应用 $target_file 中的设置..."
+
+	# -p 参数会从指定文件中加载设置
+	sudo sysctl -p "$target_file"
+	echo "已执行应用，部分可能需要重启生效"
 }
 
 #更新引导

@@ -20,7 +20,7 @@ debian/ubuntu：apt-get install ca-certificates wget -y && update-ca-certificate
 wget -O tcpx.sh "https://github.com/ylx2016/Linux-NetSpeed/raw/master/tcpx.sh" && chmod +x tcpx.sh && ./tcpx.sh
 ```
 
-卸载内核版本
+卸载内核版本(停更)
 ```
 wget -O tcp.sh "https://github.com/ylx2016/Linux-NetSpeed/raw/master/tcp.sh" && chmod +x tcp.sh && ./tcp.sh
 ```
@@ -28,7 +28,7 @@ wget -O tcp.sh "https://github.com/ylx2016/Linux-NetSpeed/raw/master/tcp.sh" && 
 
 [https://github.com/ylx2016/kernel/](https://github.com/ylx2016/kernel/)
 
-尝试加入参数直接调用优化 ./tcpx.sh op或者./tcpx.sh op2  (不会判断系统)
+尝试加入参数直接调用优化 ./tcpx.sh op1(对应22) (不会判断系统) op2(对应61) op3(对应62)
 
 ip质检
 ```
