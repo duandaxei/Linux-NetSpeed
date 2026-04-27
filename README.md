@@ -28,7 +28,7 @@ wget -O tcp.sh "https://github.com/ylx2016/Linux-NetSpeed/raw/master/tcp.sh" && 
 
 [https://github.com/ylx2016/kernel/](https://github.com/ylx2016/kernel/)
 
-尝试加入参数直接调用优化 ./tcpx.sh op1(对应22) (不会判断系统) op2(对应61) op3(对应62)
+尝试加入参数直接调用优化 ./tcpx.sh op1(对应32) (不会判断系统) op3(对应38)
 
 ip质检
 ```
