@@ -6,7 +6,7 @@ export PATH
 # =================================================
 #  全局配置区 (Configuration as Data)
 # =================================================
-readonly SH_VER="100.0.5.8"
+readonly SH_VER="100.0.5.9"
 readonly GITHUB_RAW_URL="https://raw.githubusercontent.com/ylx2016/Linux-NetSpeed/master"
 readonly GITHUB_API_URL="https://api.github.com/repos/ylx2016/kernel/releases"
 
@@ -1081,7 +1081,7 @@ start_menu() {
  ${GREEN_FONT_PREFIX}0.${FONT_COLOR_SUFFIX} 升级脚本
  ${GREEN_FONT_PREFIX}91.${FONT_COLOR_SUFFIX} 切换到卸载内核版本
  ———————————————————————————— 内核安装 —————————————————————————————
- ${GREEN_FONT_PREFIX}1.${FONT_COLOR_SUFFIX} 安装 BBR原版内核         ${GREEN_FONT_PREFIX}7.${FONT_COLOR_SUFFIX} 安装 官方稳定内核
+ ${GREEN_FONT_PREFIX}1.${FONT_COLOR_SUFFIX} 安装 BBR自编编译内核         ${GREEN_FONT_PREFIX}7.${FONT_COLOR_SUFFIX} 安装 官方稳定内核
  ${GREEN_FONT_PREFIX}2.${FONT_COLOR_SUFFIX} 安装 BBRplus版内核       ${GREEN_FONT_PREFIX}8.${FONT_COLOR_SUFFIX} 安装 官方最新内核
  ${GREEN_FONT_PREFIX}3.${FONT_COLOR_SUFFIX} 安装 Lotserver(锐速)内核 ${GREEN_FONT_PREFIX}9.${FONT_COLOR_SUFFIX} 安装 XANMOD(main)
  ${GREEN_FONT_PREFIX}4.${FONT_COLOR_SUFFIX} 安装 官方cloud内核       ${GREEN_FONT_PREFIX}10.${FONT_COLOR_SUFFIX} 安装 XANMOD(LTS)
@@ -1421,17 +1421,23 @@ check_sys_official() {
 		fi
 	elif [[ "${OS_TYPE}" == "Debian" ]]; then
 		apt update
-		if [[ "${OS_ARCH}" == "x86_64" ]]; then
-			apt-get install linux-image-amd64 linux-headers-amd64 -y
-		elif [[ "${OS_ARCH}" == "aarch64" ]]; then
-			apt-get install linux-image-arm64 linux-headers-arm64 -y
+		if [[ "${OS_ID}" == "ubuntu" || "${OS_ID}" == "pop" ]]; then
+			# Ubuntu 使用 generic 命名 (不分 x86 和 arm)
+			apt-get install linux-image-generic linux-headers-generic -y
+		else
+			# Debian 使用 amd64/arm64 命名
+			if [[ "${OS_ARCH}" == "x86_64" ]]; then
+				apt-get install linux-image-amd64 linux-headers-amd64 -y
+			elif [[ "${OS_ARCH}" == "aarch64" ]]; then
+				apt-get install linux-image-arm64 linux-headers-arm64 -y
+			fi
 		fi
 	fi
 	BBR_grub
 	echo -e "${TIP} 内核安装完毕。"
 }
 
-#检查官方最新内核并安装 (ELRepo / Backports)
+#检查官方最新内核并安装 (ELRepo / Backports / HWE)
 check_sys_official_bbr() {
 	if [[ "${OS_TYPE}" == "CentOS" ]]; then
 		[[ "${OS_ARCH}" != "x86_64" ]] && {
@@ -1456,19 +1462,27 @@ check_sys_official_bbr() {
 			echo -e "${ERROR} 不支持当前系统 CentOS ${OS_VERSION_ID} !" && exit 1
 		fi
 	elif [[ "${OS_TYPE}" == "Debian" ]]; then
-		local codename=$(lsb_release -cs 2>/dev/null || echo "")
-		[[ -z "$codename" ]] && {
-			echo -e "${ERROR} 无法获取 Debian 代号"
-			exit 1
-		}
-
-		echo "deb http://deb.debian.org/debian ${codename}-backports main" >/etc/apt/sources.list.d/${codename}-backports.list
 		apt update
+		if [[ "${OS_ID}" == "ubuntu" || "${OS_ID}" == "pop" ]]; then
+			# Ubuntu 安装官方最新内核 (HWE - 硬件使能内核)
+			echo -e "${INFO} 正在为 Ubuntu 获取官方最新 HWE 内核..."
+			apt-get install --install-recommends linux-generic-hwe-${OS_VERSION_ID} -y || apt-get install linux-generic-hwe-22.04 -y || apt-get install linux-generic-hwe-20.04 -y
+		else
+			# Debian 使用 Backports 源
+			local codename=$(lsb_release -cs 2>/dev/null || echo "")
+			[[ -z "$codename" ]] && {
+				echo -e "${ERROR} 无法获取 Debian 代号"
+				exit 1
+			}
 
-		if [[ "${OS_ARCH}" == "x86_64" ]]; then
-			apt -t "${codename}-backports" install linux-image-amd64 linux-headers-amd64 -y
-		elif [[ "${OS_ARCH}" =~ ^(arm|aarch64)$ ]]; then
-			apt -t "${codename}-backports" install linux-image-arm64 linux-headers-arm64 -y
+			echo "deb http://deb.debian.org/debian ${codename}-backports main" >/etc/apt/sources.list.d/${codename}-backports.list
+			apt update
+
+			if [[ "${OS_ARCH}" == "x86_64" ]]; then
+				apt -t "${codename}-backports" install linux-image-amd64 linux-headers-amd64 -y
+			elif [[ "${OS_ARCH}" =~ ^(arm|aarch64)$ ]]; then
+				apt -t "${codename}-backports" install linux-image-arm64 linux-headers-arm64 -y
+			fi
 		fi
 	fi
 	BBR_grub
