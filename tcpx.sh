@@ -6,7 +6,7 @@ export PATH
 # =================================================
 #  全局配置区 (Configuration as Data)
 # =================================================
-readonly SH_VER="100.0.5.12"
+readonly SH_VER="100.0.5.14"
 readonly GITHUB_RAW_URL="https://raw.githubusercontent.com/ylx2016/Linux-NetSpeed/master"
 readonly GITHUB_API_URL="https://api.github.com/repos/ylx2016/kernel/releases"
 
@@ -241,19 +241,22 @@ remove_old_headers() {
 }
 
 # 终极内核安装函数
-# 用法: install_kernel_generic <内核描述名称> <Headers_URL> <Image_URL>
-# 终极内核安装函数
-# 用法: install_kernel_generic <内核描述名称> <Headers_URL> <Image_URL>
+# 用法: install_kernel_generic <内核描述名称> <Headers_URL> <Image_URL> <版本号>
 install_kernel_generic() {
 	local kernel_desc="$1"
 	local head_url="$2"
 	local img_url="$3"
+	local kernel_version="$4" # 新增参数，用于 UI 显示
 
 	echo -e "${INFO} ================================================"
-	echo -e "${INFO} 开始安装: ${kernel_desc} 内核"
+	if [[ -n "$kernel_version" ]]; then
+		echo -e "${INFO} 开始安装: ${kernel_desc} (版本: \033[32m${kernel_version}\033[0m)"
+	else
+		echo -e "${INFO} 开始安装: ${kernel_desc}"
+	fi
 	echo -e "${INFO} ================================================"
 
-	# 只强制检查 img_url，因为某些内核（如 Cloud）本身就没有 Headers
+	# 只强制检查 img_url，因为某些内核（如 Cloud）本身可能不强制要求 Headers
 	if [[ -z "$img_url" ]]; then
 		echo -e "${ERROR} 传入的镜像文件下载链接为空，可能是 API 解析失败或上游移除了文件！"
 		exit 1
@@ -291,7 +294,9 @@ install_kernel_generic() {
 		echo -e "${INFO} 正在执行 DPKG 安装..."
 		dpkg -i "$img_file"
 		[[ -n "$head_url" ]] && dpkg -i "$head_file"
-		apt-get install -f -y # 自动修复可能缺失的依赖
+
+		echo -e "${INFO} 正在检查并修复可能缺失的依赖环境..."
+		apt-get install -f -y
 	fi
 
 	# 善后清理
@@ -305,27 +310,44 @@ install_kernel_generic() {
 installbbr() {
 	local head_url=""
 	local img_url=""
-	local tag_kw="Debian_Kernel"
-	local arch_kw="amd64"
+	local tag_kw=""
+	local arch_kw=""
+	local img_kw=""
 
 	if [[ "${OS_TYPE}" == "CentOS" ]]; then
-		# CentOS 目前保留你的写死链接逻辑
-		head_url="https://github.com/ylx2016/kernel/releases/download/Centos_Kernel_6.1.35_latest_bbr_2023.06.22-0855/kernel-headers-6.1.35-1.x86_64.rpm"
-		img_url="https://github.com/ylx2016/kernel/releases/download/Centos_Kernel_6.1.35_latest_bbr_2023.06.22-0855/kernel-6.1.35-1.x86_64.rpm"
+		# 适配新编译的 CentOS Cloud 内核
+		tag_kw="CentOS_Kernel_Cloud"
+		arch_kw="x86_64"
+		# 【核心修复 1】直接匹配 kernel-加数字，从源头完美避开 headers 和 devel
+		img_kw="kernel-[0-9]"
 	elif [[ "${OS_TYPE}" == "Debian" ]]; then
+		# 适配新编译的 Debian Cloud 内核
+		tag_kw="Debian_Kernel_Cloud"
+		arch_kw="amd64"
+		img_kw="image" # Debian dpkg 生成的包名为 linux-image 开头
 		if [[ "$OS_ARCH" == "aarch64" ]]; then
-			tag_kw="Debian_Kernel_arm64"
+			tag_kw="Debian_Kernel_Cloud_arm64"
 			arch_kw="arm64"
 		fi
-
-		echo -e "${INFO} 正在向 ylx2016/kernel 请求最新 BBR 内核数据..."
-		head_url=$(get_github_asset "ylx2016/kernel" "${tag_kw}" "headers" "${arch_kw}")
-		# 镜像文件通常不包含 headers 关键字
-		img_url=$(get_github_asset "ylx2016/kernel" "${tag_kw}" "image" "${arch_kw}")
 	fi
 
-	# 一行代码完成下载、清理、安装、更新引导全流程
-	install_kernel_generic "BBR原版内核" "$head_url" "$img_url"
+	echo -e "${INFO} 正在向 Github/ylx2016 请求最新 ${tag_kw} 内核数据..."
+
+	# 获取下载链接 (现在抓取到的绝对纯净，无需二次 grep -v)
+	head_url=$(get_github_asset "ylx2016/kernel" "${tag_kw}" "headers" "${arch_kw}")
+	img_url=$(get_github_asset "ylx2016/kernel" "${tag_kw}" "${img_kw}" "${arch_kw}")
+
+	# 【核心修复 2】利用 -oE 标准正则提取版本号，避免部分系统不支持 -P 导致版本号变空
+	local kernel_version=$(echo "$img_url" | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -n 1)
+
+	if [[ -n "$kernel_version" ]]; then
+		echo -e "${INFO} 解析成功！获取到的最新云端内核版本为: \033[32m${kernel_version}\033[0m"
+	else
+		echo -e "${INFO} 解析成功！已获取到下载链接，但未能匹配出纯净版本号。"
+	fi
+
+	# 将解析出的版本号作为第四个参数传递给安装函数
+	install_kernel_generic "BBR Cloud 优化内核" "$head_url" "$img_url" "$kernel_version"
 }
 
 # 安装 BBRplus 新版内核 (调用引擎)
@@ -821,7 +843,7 @@ show_kernels() {
 	echo -e "${INFO} ==================================================="
 	echo -e "${INFO} 当前系统中已安装的内核包："
 	if [[ "${OS_TYPE}" == "CentOS" ]]; then
-		rpm -qa | grep -E "^kernel-(image|core|modules|devel|headers)" | sort -V
+		rpm -qa | grep -E "^kernel(-ml|-lt)?(-image|-core|-modules|-devel|-headers)?-[0-9]" | sort -V
 		echo -e "${INFO} ==================================================="
 		echo -e "${INFO} GRUB 引导项 (通常 index=0 为默认启动项)："
 		grubby --info=ALL | grep -E "^kernel|^index"
@@ -848,7 +870,7 @@ delete_kernel_custom() {
 
 	# 使用更精准的包查询方式，防止名字过长被截断
 	if [[ "${OS_TYPE}" == "CentOS" ]]; then
-		mapfile -t kernel_list < <(rpm -qa | grep -E "^kernel-(image|core|modules|devel|headers)" | sort -V)
+		mapfile -t kernel_list < <(rpm -qa | grep -E "^kernel(-ml|-lt)?(-image|-core|-modules|-devel|-headers)?-[0-9]" | sort -V)
 	elif [[ "${OS_TYPE}" == "Debian" ]]; then
 		mapfile -t kernel_list < <(dpkg-query -W -f='${Package}\n' | grep -E "^linux-(image|headers|modules)" | sort -V)
 	fi
@@ -1088,7 +1110,7 @@ start_menu() {
  ${GREEN_FONT_PREFIX}0.${FONT_COLOR_SUFFIX} 升级脚本
  ${GREEN_FONT_PREFIX}91.${FONT_COLOR_SUFFIX} 切换到卸载内核版本
  ———————————————————————————— 内核安装 —————————————————————————————
- ${GREEN_FONT_PREFIX}1.${FONT_COLOR_SUFFIX} 安装 BBR自编编译内核         ${GREEN_FONT_PREFIX}7.${FONT_COLOR_SUFFIX} 安装 官方稳定内核
+ ${GREEN_FONT_PREFIX}1.${FONT_COLOR_SUFFIX} 安装 BBR自编编译内核     ${GREEN_FONT_PREFIX}7.${FONT_COLOR_SUFFIX} 安装 官方稳定内核
  ${GREEN_FONT_PREFIX}2.${FONT_COLOR_SUFFIX} 安装 BBRplus版内核       ${GREEN_FONT_PREFIX}8.${FONT_COLOR_SUFFIX} 安装 官方最新内核
  ${GREEN_FONT_PREFIX}3.${FONT_COLOR_SUFFIX} 安装 Lotserver(锐速)内核 ${GREEN_FONT_PREFIX}9.${FONT_COLOR_SUFFIX} 安装 XANMOD(main)
  ${GREEN_FONT_PREFIX}4.${FONT_COLOR_SUFFIX} 安装 官方cloud内核       ${GREEN_FONT_PREFIX}10.${FONT_COLOR_SUFFIX} 安装 XANMOD(LTS)
