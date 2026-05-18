@@ -6,7 +6,7 @@ export PATH
 # =================================================
 #  全局配置区 (Configuration as Data)
 # =================================================
-readonly SH_VER="100.0.5.14"
+readonly SH_VER="100.0.5.15"
 readonly GITHUB_RAW_URL="https://raw.githubusercontent.com/ylx2016/Linux-NetSpeed/master"
 readonly GITHUB_API_URL="https://api.github.com/repos/ylx2016/kernel/releases"
 
@@ -1006,7 +1006,7 @@ install_lotspeed() {
 # 单独启用 LotSpeed 加速 (免编译快速切换)
 enable_lotspeed_standalone() {
 	if ! command -v lotspeed >/dev/null 2>&1; then
-		echo -e "${ERROR} 未检测到 LotSpeed，请先执行菜单 [29] 进行编译安装！"
+		echo -e "${ERROR} 未检测到 LotSpeed，请先执行菜单 [26] 进行编译安装！"
 		sleep 3
 		return
 	fi
