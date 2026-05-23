@@ -20,10 +20,8 @@ debian/ubuntu：apt-get install ca-certificates wget -y && update-ca-certificate
 wget -O tcpx.sh "https://github.com/ylx2016/Linux-NetSpeed/raw/master/tcpx.sh" && chmod +x tcpx.sh && ./tcpx.sh
 ```
 
-卸载内核版本(停更)
-```
-wget -O tcp.sh "https://github.com/ylx2016/Linux-NetSpeed/raw/master/tcp.sh" && chmod +x tcp.sh && ./tcp.sh
-```
+提示：设置BBR和优化已经分开，需要各走一遍。即20和32都需要运行一遍，不分先后。
+
 关联action自动编译内核
 
 [https://github.com/ylx2016/kernel/](https://github.com/ylx2016/kernel/)
