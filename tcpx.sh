@@ -6,7 +6,7 @@ export PATH
 # =================================================
 #  全局配置区 (Configuration as Data)
 # =================================================
-readonly SH_VER="100.0.5.15"
+readonly SH_VER="100.0.5.17"
 readonly GITHUB_RAW_URL="https://raw.githubusercontent.com/ylx2016/Linux-NetSpeed/master"
 readonly GITHUB_API_URL="https://api.github.com/repos/ylx2016/kernel/releases"
 
@@ -130,53 +130,119 @@ check_sys() {
 # 全局变量：是否在中国大陆
 IS_CN=0
 
-# 1. 极其稳定且快速的 CN 节点检测 (利用 Cloudflare CDN Trace)
+# 全局最优镜像变量
+BEST_MIRROR=""
+
+# 1. 极其稳定且快速的 CN 节点检测 (利用 Cloudflare CDN Trace) 与镜像测速
 check_cn_status() {
 	# 设置 3 秒超时，获取 Cloudflare 边缘节点看到的 IP 归属地
 	local cf_trace=$(curl -sL --max-time 3 https://www.cloudflare.com/cdn-cgi/trace || echo "")
 	if echo "$cf_trace" | grep -q "loc=CN"; then
 		IS_CN=1
-		echo -e "${INFO} 检测到当前节点位于中国大陆，将自动启用 GitHub 加速镜像。"
+		echo -e "${INFO} 检测到当前节点位于中国大陆，正在为您测速并选择最快的 GitHub 镜像..."
+
+		local mirrors=(
+			"https://gh-proxy.com/"
+			"https://ghfast.top/"
+			"https://hub.gitmirror.com/"
+			"https://gh.ddlc.top/"
+		)
+
+		# 使用极小的 releases 校验文件作为测速目标 (不到 100 字节)，完美适配镜像站的 release 代理规则
+		local test_url="https://github.com/docker/compose/releases/latest/download/docker-compose-linux-x86_64.sha256"
+		local best_time=9999
+		local failed_mirrors=()
+
+		for prefix in "${mirrors[@]}"; do
+			local target_url="${prefix}${test_url}"
+
+			# 测速: 限定最多 2 秒超时，-r 0-512 限制只读取头部数据，防止大文件卡死
+			local time_cost=$(curl -sL -m 2 -r 0-512 -o /dev/null -w "%{time_total}" "$target_url" || echo "9999")
+
+			# 如果返回 9999 或者 0.000 (完全没连上)，记录为失败节点
+			if [[ "$time_cost" == "9999" || "$time_cost" == "0.000" ]]; then
+				failed_mirrors+=("$prefix")
+			else
+				# 使用 awk 比较浮点数时间，找出延迟最低的
+				if awk "BEGIN {exit !($time_cost < $best_time)}"; then
+					best_time=$time_cost
+					BEST_MIRROR=$prefix
+				fi
+			fi
+		done
+
+		if [[ "$best_time" == "9999" ]]; then
+			echo -e "${TIP} 所有镜像测速超时，将使用默认轮询模式。"
+			BEST_MIRROR="poll"
+		else
+			echo -e "${INFO} 测速完成！当前网络最优镜像为: ${GREEN_FONT_PREFIX}${BEST_MIRROR}${FONT_COLOR_SUFFIX} (响应时间: ${best_time}s)"
+		fi
+
+		# 集中打印出测速失败的镜像，方便您排查和后续替换
+		if [[ ${#failed_mirrors[@]} -gt 0 ]]; then
+			echo -e "${TIP} 以下镜像测速超时或失效 (已自动剔除首选):"
+			for fail_m in "${failed_mirrors[@]}"; do
+				echo -e "  - ${RED_FONT_PREFIX}${fail_m}${FONT_COLOR_SUFFIX}"
+			done
+		fi
 	else
 		IS_CN=0
 		echo -e "${INFO} 当前节点位于海外，使用 GitHub 直连网络。"
 	fi
 }
 
-# 2. 安全可靠的下载函数 (自带多镜像轮询 failover)
-# 用法: safe_wget <下载直链> <保存路径>
+# 2. 安全可靠的下载函数 (自带多镜像轮询 failover，支持动态最优节点)
 safe_wget() {
 	local url="$1"
 	local dest="$2"
 	local timeout=15
 
-	# 定义多个加速镜像前缀 (按稳定性排序)
+	# 定义默认的加速镜像前缀池
 	local mirrors=(
-		"" # 第一个是原生链接，给海外机准备的
 		"https://gh-proxy.com/"
 		"https://ghfast.top/"
 		"https://hub.gitmirror.com/"
 		"https://gh.ddlc.top/"
 	)
 
-	# 如果不是国内，只保留原生链接（空前缀）
-	[[ $IS_CN -eq 0 ]] && mirrors=("")
+	# 核心逻辑：根据测速结果重构下载队列
+	if [[ $IS_CN -eq 0 ]]; then
+		mirrors=("") # 海外节点只保留原生空前缀
+	else
+		# 如果测速成功找到了最优节点，将其提取到数组最前面
+		if [[ -n "$BEST_MIRROR" && "$BEST_MIRROR" != "poll" ]]; then
+			local new_mirrors=("$BEST_MIRROR")
+			for m in "${mirrors[@]}"; do
+				[[ "$m" != "$BEST_MIRROR" ]] && new_mirrors+=("$m")
+			done
+			mirrors=("${new_mirrors[@]}")
+		fi
+		# 给国内机加上原生链接作为终极保底
+		mirrors+=("")
+	fi
 
 	for prefix in "${mirrors[@]}"; do
 		# 组装最终下载链接
 		local target_url="${prefix}${url}"
 		[[ -n "$prefix" ]] && target_url="${prefix}$(echo "$url" | sed 's|^https://||')"
 
-		echo -e "${INFO} 正在下载: ${dest} ..."
-		# 使用 wget，设置重试 2 次，跳过证书校验
+		if [[ -z "$prefix" ]]; then
+			echo -e "${INFO} 正在请求: ${dest} (直连网络) ..."
+		else
+			echo -e "${INFO} 正在请求: ${dest} (镜像: ${prefix}) ..."
+		fi
+
+		# 使用 wget 下载，跳过证书校验
 		if wget --no-check-certificate -qT "$timeout" -t 2 -O "$dest" "$target_url"; then
-			echo -e "${INFO} 下载成功！"
+			echo -e "${INFO} ${dest} 下载成功！"
 			return 0
 		fi
-		[[ $IS_CN -eq 1 ]] && echo -e "${TIP} 镜像节点下载失败，尝试切换下一个节点..."
+
+		# 当前节点失败时提示并继续下一个循环
+		echo -e "${TIP} 当前节点下载异常，正在无缝切换备用节点..."
 	done
 
-	echo -e "${ERROR} 文件 ${dest} 所有下载节点均失败，请检查网络或稍后再试！"
+	echo -e "${ERROR} 文件 ${dest} 所有下载节点均失效，请检查网络或稍后再试！"
 	return 1
 }
 
@@ -233,9 +299,9 @@ remove_old_headers() {
 	if [[ "${OS_TYPE}" == "CentOS" ]]; then
 		# 找出不是当前正在运行的 kernel-headers 并卸载
 		local current_ker=$(uname -r)
-		rpm -qa | grep 'kernel-headers' | grep -v "$current_ker" | xargs -r rpm -e --nodeps >/dev/null 2>&1
+		rpm -qa | grep -E 'kernel(-ml|-lt|-uek|-rt|-plus)?-headers' | grep -v "$current_ker" | xargs -r rpm -e --nodeps >/dev/null 2>&1
 	elif [[ "${OS_TYPE}" == "Debian" ]]; then
-		dpkg -l | grep 'linux-headers' | awk '{print $2}' | grep -v "$(uname -r)" | xargs -r apt-get purge -y >/dev/null 2>&1
+		dpkg -l | grep -E '(linux|proxmox|pve|raspberrypi)-headers' | awk '{print $2}' | grep -v "$(uname -r)" | xargs -r apt-get purge -y >/dev/null 2>&1
 		apt-get autoremove -y >/dev/null 2>&1
 	fi
 }
@@ -843,12 +909,12 @@ show_kernels() {
 	echo -e "${INFO} ==================================================="
 	echo -e "${INFO} 当前系统中已安装的内核包："
 	if [[ "${OS_TYPE}" == "CentOS" ]]; then
-		rpm -qa | grep -E "^kernel(-ml|-lt)?(-image|-core|-modules|-devel|-headers)?-[0-9]" | sort -V
+		rpm -qa | grep -E "^kernel(-ml|-lt|-uek|-rt|-plus)?(-image|-core|-modules|-devel|-headers)?-[0-9]" | sort -V
 		echo -e "${INFO} ==================================================="
 		echo -e "${INFO} GRUB 引导项 (通常 index=0 为默认启动项)："
 		grubby --info=ALL | grep -E "^kernel|^index"
 	elif [[ "${OS_TYPE}" == "Debian" ]]; then
-		dpkg -l | grep -E "^ii  linux-(image|headers|modules)" | awk '{print $2, $3}' | column -t | sort -V
+		dpkg -l | grep -E "^ii  (linux-(image|headers|modules)|pve-kernel|proxmox-kernel|proxmox-headers|raspberrypi-kernel)" | awk '{print $2, $3}' | column -t | sort -V
 		echo -e "${INFO} ==================================================="
 		echo -e "${INFO} /boot 目录下的内核镜像："
 		ls -1v /boot/vmlinuz-* 2>/dev/null
@@ -870,9 +936,9 @@ delete_kernel_custom() {
 
 	# 使用更精准的包查询方式，防止名字过长被截断
 	if [[ "${OS_TYPE}" == "CentOS" ]]; then
-		mapfile -t kernel_list < <(rpm -qa | grep -E "^kernel(-ml|-lt)?(-image|-core|-modules|-devel|-headers)?-[0-9]" | sort -V)
+		mapfile -t kernel_list < <(rpm -qa | grep -E "^kernel(-ml|-lt|-uek|-rt|-plus)?(-image|-core|-modules|-devel|-headers)?-[0-9]" | sort -V)
 	elif [[ "${OS_TYPE}" == "Debian" ]]; then
-		mapfile -t kernel_list < <(dpkg-query -W -f='${Package}\n' | grep -E "^linux-(image|headers|modules)" | sort -V)
+		mapfile -t kernel_list < <(dpkg-query -W -f='${Package}\n' | grep -E "^(linux-(image|headers|modules)|pve-kernel|proxmox-kernel|proxmox-headers|raspberrypi-kernel)" | sort -V)
 	fi
 
 	if [[ ${#kernel_list[@]} -eq 0 ]]; then
@@ -1676,22 +1742,22 @@ check_status() {
 
 	# 检查 Headers 状态 (利用全局 OS_TYPE)
 	if [[ "${OS_TYPE}" == "CentOS" ]]; then
-		installed_headers=$(rpm -qa | grep -E "kernel-devel|kernel-headers" | grep -v '^$' || echo "")
+		installed_headers=$(rpm -qa | grep -E "kernel(-ml|-lt|-uek|-rt|-plus)?-(devel|headers)" | grep -v '^$' || echo "")
 		if [[ -z "$installed_headers" ]]; then
 			headers_status="未安装"
 		else
-			if echo "$installed_headers" | grep -q "kernel-devel-${kernel_version_full}\|kernel-headers-${kernel_version_full}"; then
+			if echo "$installed_headers" | grep -q -E "kernel(-ml|-lt|-uek|-rt|-plus)?-(devel|headers)-${kernel_version_full}"; then
 				headers_status="已匹配"
 			else
 				headers_status="未匹配"
 			fi
 		fi
 	elif [[ "${OS_TYPE}" == "Debian" ]]; then
-		installed_headers=$(dpkg -l | grep -E "linux-headers|linux-image" | awk '{print $2}' | grep -v '^$' || echo "")
+		installed_headers=$(dpkg -l | grep -E "(linux|proxmox|pve|raspberrypi)-(headers|image)" | awk '{print $2}' | grep -v '^$' || echo "")
 		if [[ -z "$installed_headers" ]]; then
 			headers_status="未安装"
 		else
-			if echo "$installed_headers" | grep -q "linux-headers-${kernel_version_full}"; then
+			if echo "$installed_headers" | grep -q -E "(linux|proxmox|pve|raspberrypi)-headers-${kernel_version_full}"; then
 				headers_status="已匹配"
 			else
 				headers_status="未匹配"
