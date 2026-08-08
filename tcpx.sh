@@ -6,9 +6,9 @@ export PATH
 # =================================================
 #  全局配置区 (Configuration as Data)
 # =================================================
-readonly SH_VER="100.0.5.17"
+readonly SH_VER="100.0.6.3"
 readonly GITHUB_RAW_URL="https://raw.githubusercontent.com/ylx2016/Linux-NetSpeed/master"
-readonly GITHUB_API_URL="https://api.github.com/repos/ylx2016/kernel/releases"
+readonly CLOUD_STATE_FILE="/etc/tcpx_cloud_lastver" # installcloud 记忆上次探测到的最高可安装 Cloud 内核
 
 # 颜色变量定义
 readonly GREEN_FONT_PREFIX="\033[32m"
@@ -112,6 +112,27 @@ check_sys() {
 		fi
 	fi
 
+	# 4.1 依赖复检：上面所有安装命令的输出都被重定向丢弃了，装失败也毫无提示。
+	# 若不在此处硬失败，后续 get_github_asset 会因缺少 jq 而静默返回空，
+	# 用户只能看到"无法获取资源列表"这种完全误导性的报错。
+	local missing_cmds=()
+	for cmd in "${required_cmds[@]}"; do
+		command -v "$cmd" >/dev/null 2>&1 || missing_cmds+=("$cmd")
+	done
+	if [[ ${#missing_cmds[@]} -gt 0 ]]; then
+		echo -e "${ERROR} 以下必需依赖安装失败，脚本无法继续运行:"
+		for cmd in "${missing_cmds[@]}"; do
+			echo -e "  - ${RED_FONT_PREFIX}${cmd}${FONT_COLOR_SUFFIX}"
+		done
+		echo -e "${TIP} 请先手动安装后重试，例如:"
+		if [[ "${OS_TYPE}" == "CentOS" ]]; then
+			echo -e "  yum install -y epel-release && yum install -y ${missing_cmds[*]}"
+		else
+			echo -e "  apt-get update && apt-get install -y ${missing_cmds[*]}"
+		fi
+		exit 1
+	fi
+
 	# 5. 补充底层内核模块管理依赖 (应对极简版 LXC/VPS 模板)
 	if ! command -v lsmod >/dev/null 2>&1; then
 		echo -e "${INFO} 正在补齐系统核心依赖: kmod (提供 lsmod/rmmod 命令) ..."
@@ -124,6 +145,71 @@ check_sys() {
 }
 
 # =================================================
+#  安装前置守卫 (容器环境 / /boot 空间)
+# =================================================
+
+# 检测是否运行在容器中。容器共用宿主机内核，装内核毫无意义且可能破坏容器。
+check_container() {
+	local virt=""
+	if command -v systemd-detect-virt >/dev/null 2>&1; then
+		virt=$(systemd-detect-virt 2>/dev/null)
+	elif command -v virt-what >/dev/null 2>&1; then
+		virt=$(virt-what 2>/dev/null | head -n 1)
+	fi
+
+	case "$virt" in
+	lxc | lxc-libvirt | openvz | docker | podman | rkt | wsl | systemd-nspawn)
+		echo -e "${ERROR} 检测到当前为容器环境 (${virt})，容器共用宿主机内核，无法安装内核！"
+		return 1
+		;;
+	esac
+
+	# 兜底: 部分老旧 OpenVZ/LXC 无 systemd-detect-virt，用特征文件识别
+	if [[ -d /proc/vz && ! -d /proc/bc ]]; then
+		echo -e "${ERROR} 检测到 OpenVZ 容器环境，无法安装内核！"
+		return 1
+	fi
+	if grep -qaE '(lxc|docker|containerd)' /proc/1/cgroup 2>/dev/null; then
+		echo -e "${ERROR} 检测到容器环境 (cgroup 特征)，无法安装内核！"
+		return 1
+	fi
+	return 0
+}
+
+# 检查 /boot 剩余空间。小 /boot 在生成 initramfs 阶段中途失败会留下半配置状态，重启即失联。
+check_boot_space() {
+	local need_mb="${1:-300}"
+	local avail_mb
+	avail_mb=$(df -Pm /boot 2>/dev/null | awk 'NR==2 {print $4}')
+
+	if [[ -z "$avail_mb" ]]; then
+		echo -e "${TIP} 无法获取 /boot 剩余空间，跳过检查。"
+		return 0
+	fi
+
+	if [[ "$avail_mb" -lt "$need_mb" ]]; then
+		echo -e "${ERROR} /boot 剩余空间不足: 当前 ${avail_mb}MB，建议至少 ${need_mb}MB。"
+		echo -e "${TIP} 内核安装极可能在生成 initramfs 时中途失败，导致系统无法引导！"
+		echo -e "${TIP} 请先使用菜单 [52] 删除不再使用的旧内核后重试。"
+		read -rp "确认无视风险并继续？(请输入大写 YES 确认): " force_go
+		[[ "$force_go" != "YES" ]] && {
+			echo -e "${INFO} 已取消安装。"
+			return 1
+		}
+	else
+		echo -e "${INFO} /boot 剩余空间检查通过: ${avail_mb}MB 可用。"
+	fi
+	return 0
+}
+
+# 内核安装统一前置检查
+pre_install_check() {
+	check_container || return 1
+	check_boot_space 300 || return 1
+	return 0
+}
+
+# =================================================
 #  网络通信与下载模块
 # =================================================
 
@@ -132,6 +218,26 @@ IS_CN=0
 
 # 全局最优镜像变量
 BEST_MIRROR=""
+
+# 判断 URL 是否为 GitHub 系资源 (只有这些才需要走加速镜像)
+# 非 GitHub 域名 (如 deb.debian.org / snapshot.debian.org) 套镜像前缀必然 404，
+# 白白消耗 4 次超时，故必须先行识别。
+is_github_url() {
+	local url="$1"
+	[[ "$url" =~ ^https?://(www\.)?(github\.com|raw\.githubusercontent\.com|objects\.githubusercontent\.com|codeload\.github\.com)/ ]]
+}
+
+# 统一的镜像 URL 组装规则 (测速与实际下载共用，保证两者行为一致)
+build_mirror_url() {
+	local prefix="$1"
+	local url="$2"
+	if [[ -z "$prefix" ]]; then
+		echo "$url"
+	else
+		# 镜像站约定: 前缀后直接接不带协议头的原始地址
+		echo "${prefix}$(echo "$url" | sed 's|^https\?://||')"
+	fi
+}
 
 # 1. 极其稳定且快速的 CN 节点检测 (利用 Cloudflare CDN Trace) 与镜像测速
 check_cn_status() {
@@ -154,13 +260,17 @@ check_cn_status() {
 		local failed_mirrors=()
 
 		for prefix in "${mirrors[@]}"; do
-			local target_url="${prefix}${test_url}"
+			# 与 safe_wget 保持完全一致的 URL 改写规则，确保测速结果能代表实际下载可用性
+			local target_url=$(build_mirror_url "$prefix" "$test_url")
 
 			# 测速: 限定最多 2 秒超时，-r 0-512 限制只读取头部数据，防止大文件卡死
-			local time_cost=$(curl -sL -m 2 -r 0-512 -o /dev/null -w "%{time_total}" "$target_url" || echo "9999")
+			# 同时取回 http_code，避免"快速返回 403/404 错误页"的失效镜像在测速中胜出
+			local probe=$(curl -sL -m 2 -r 0-512 -o /dev/null -w "%{http_code} %{time_total}" "$target_url" 2>/dev/null)
+			local http_code=$(echo "$probe" | awk '{print $1}')
+			local time_cost=$(echo "$probe" | awk '{print $2}')
 
-			# 如果返回 9999 或者 0.000 (完全没连上)，记录为失败节点
-			if [[ "$time_cost" == "9999" || "$time_cost" == "0.000" ]]; then
+			# 仅 200/206 视为有效；其余(含连接失败的空输出)一律记为失败节点
+			if [[ ! "$http_code" =~ ^(200|206)$ ]] || [[ -z "$time_cost" ]]; then
 				failed_mirrors+=("$prefix")
 			else
 				# 使用 awk 比较浮点数时间，找出延迟最低的
@@ -206,8 +316,9 @@ safe_wget() {
 	)
 
 	# 核心逻辑：根据测速结果重构下载队列
-	if [[ $IS_CN -eq 0 ]]; then
-		mirrors=("") # 海外节点只保留原生空前缀
+	# 非 GitHub 资源 (Debian 官方源等) 直接直连，套镜像只会白等 4 次超时
+	if [[ $IS_CN -eq 0 ]] || ! is_github_url "$url"; then
+		mirrors=("") # 海外节点 / 非 GitHub 资源只保留原生空前缀
 	else
 		# 如果测速成功找到了最优节点，将其提取到数组最前面
 		if [[ -n "$BEST_MIRROR" && "$BEST_MIRROR" != "poll" ]]; then
@@ -222,9 +333,8 @@ safe_wget() {
 	fi
 
 	for prefix in "${mirrors[@]}"; do
-		# 组装最终下载链接
-		local target_url="${prefix}${url}"
-		[[ -n "$prefix" ]] && target_url="${prefix}$(echo "$url" | sed 's|^https://||')"
+		# 组装最终下载链接 (与测速阶段共用同一套规则)
+		local target_url=$(build_mirror_url "$prefix" "$url")
 
 		if [[ -z "$prefix" ]]; then
 			echo -e "${INFO} 正在请求: ${dest} (直连网络) ..."
@@ -234,8 +344,13 @@ safe_wget() {
 
 		# 使用 wget 下载，跳过证书校验
 		if wget --no-check-certificate -qT "$timeout" -t 2 -O "$dest" "$target_url"; then
-			echo -e "${INFO} ${dest} 下载成功！"
-			return 0
+			# 防御半截包/错误页: 空文件视为失败，继续切换节点
+			if [[ -s "$dest" ]]; then
+				echo -e "${INFO} ${dest} 下载成功！"
+				return 0
+			fi
+			echo -e "${TIP} 下载内容为空，判定为无效响应。"
+			rm -f "$dest"
 		fi
 
 		# 当前节点失败时提示并继续下一个循环
@@ -273,6 +388,10 @@ get_github_asset() {
 	# 利用 grep -iE 进行层层精准过滤
 	local result=$(echo "$all_urls" | grep -iE "$tag_kw" | grep -iE "$ast_kw")
 	[[ -n "$arch_kw" ]] && result=$(echo "$result" | grep -iE "$arch_kw")
+
+	# 排除调试符号包与未签名包：dbg 包体积可达数百 MB 且完全不可用于安装，
+	# 而 grep "image" 会同时命中 linux-image-*-dbg_*.deb，head -n 1 有取错风险
+	result=$(echo "$result" | grep -viE 'dbg|debug|unsigned')
 
 	# 终极防呆机制：如果是 x86_64 架构，且关键词中没有声明要找 arm64，则强行排除带 arm64/aarch64 的链接，防止模糊匹配误伤
 	if [[ "$arch_kw" != *"arm64"* && "$tag_kw" != *"arm64"* && "$OS_ARCH" != "aarch64" ]]; then
@@ -325,48 +444,85 @@ install_kernel_generic() {
 	# 只强制检查 img_url，因为某些内核（如 Cloud）本身可能不强制要求 Headers
 	if [[ -z "$img_url" ]]; then
 		echo -e "${ERROR} 传入的镜像文件下载链接为空，可能是 API 解析失败或上游移除了文件！"
-		exit 1
+		return 1
 	fi
 
-	# 清理旧 headers
-	remove_old_headers
+	# 创建独立的工作目录 (mktemp 避免 /tmp 下可预测目录名被抢先创建)
+	local work_dir
+	work_dir=$(mktemp -d /tmp/kernel_install.XXXXXX) || {
+		echo -e "${ERROR} 无法创建临时目录！"
+		return 1
+	}
+	# apt 会用沙箱用户 _apt 访问此目录；700 权限会触发 "unsandboxed" 警告。
+	# 755 仅允许读/遍历，.deb 文件本身仍由 root 拥有，不存在安全问题。
+	chmod 755 "$work_dir"
+	trap 'cd /tmp; rm -rf "$work_dir"; trap - RETURN' RETURN
+	cd "$work_dir" || {
+		echo -e "${ERROR} 无法进入临时目录 ${work_dir}！"
+		return 1
+	}
 
-	# 创建独立的工作目录
-	local work_dir="/tmp/kernel_install_$(date +%s)"
-	mkdir -p "$work_dir" && cd "$work_dir" || exit 1
+	# 安装前记录 /boot 中已有的内核镜像数量，用于事后验证是否真的装上了
+	local vmlinuz_before=$(ls -1 /boot/vmlinuz-* 2>/dev/null | wc -l)
 
 	# 根据系统执行不同的下载和安装逻辑
+	# 关键顺序: 先把所有包下载并校验完成，再清理旧 headers，最后安装。
+	# 若先清理后下载，一旦下载失败就会停在"旧 headers 已删、新内核没装"的破损状态。
 	if [[ "${OS_TYPE}" == "CentOS" ]]; then
 		local head_file="kernel-headers.rpm"
 		local img_file="kernel-image.rpm"
 
-		[[ -n "$head_url" ]] && { safe_wget "$head_url" "$head_file" || exit 1; }
-		safe_wget "$img_url" "$img_file" || exit 1
+		[[ -n "$head_url" ]] && { safe_wget "$head_url" "$head_file" || return 1; }
+		safe_wget "$img_url" "$img_file" || return 1
+
+		# 下载全部成功后才动系统
+		remove_old_headers
 
 		echo -e "${INFO} 正在执行 YUM 安装..."
 		if [[ -n "$head_url" ]]; then
-			yum install -y "$img_file" "$head_file"
+			yum install -y "./$img_file" "./$head_file" || {
+				echo -e "${ERROR} 内核包安装失败，请检查上方 yum 输出！"
+				return 1
+			}
 		else
-			yum install -y "$img_file"
+			yum install -y "./$img_file" || {
+				echo -e "${ERROR} 内核包安装失败，请检查上方 yum 输出！"
+				return 1
+			}
 		fi
 
 	elif [[ "${OS_TYPE}" == "Debian" ]]; then
 		local head_file="linux-headers.deb"
 		local img_file="linux-image.deb"
+		local deb_list=()
 
-		[[ -n "$head_url" ]] && { safe_wget "$head_url" "$head_file" || exit 1; }
-		safe_wget "$img_url" "$img_file" || exit 1
+		[[ -n "$head_url" ]] && { safe_wget "$head_url" "$head_file" || return 1; }
+		safe_wget "$img_url" "$img_file" || return 1
 
-		echo -e "${INFO} 正在执行 DPKG 安装..."
-		dpkg -i "$img_file"
-		[[ -n "$head_url" ]] && dpkg -i "$head_file"
+		# 下载全部成功后才动系统
+		remove_old_headers
 
-		echo -e "${INFO} 正在检查并修复可能缺失的依赖环境..."
-		apt-get install -f -y
+		deb_list+=("./$img_file")
+		[[ -n "$head_url" && -s "$head_file" ]] && deb_list+=("./$head_file")
+
+		# 用 apt-get install ./xxx.deb 取代 dpkg -i + apt-get -f。
+		# 前者是事务性的: 会自动从源里解析 linux-modules-* 等依赖，失败时干净回滚；
+		# 后者在依赖无解时 apt-get -f 可能选择"卸载刚装上的内核"来修复，且返回值常为 0。
+		echo -e "${INFO} 正在执行 APT 安装 (自动解析依赖)..."
+		if ! DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends "${deb_list[@]}"; then
+			echo -e "${ERROR} 内核包安装失败，依赖无法满足或包不兼容当前系统！"
+			echo -e "${TIP} 系统未被改动，可尝试菜单 [4] 中的 'a' 自动探测可安装版本。"
+			return 1
+		fi
 	fi
 
-	# 善后清理
-	cd /tmp && rm -rf "$work_dir"
+	# 验证 /boot 中确实新增了内核镜像，避免"装失败却报成功"
+	local vmlinuz_after=$(ls -1 /boot/vmlinuz-* 2>/dev/null | wc -l)
+	if [[ "$vmlinuz_after" -le "$vmlinuz_before" ]]; then
+		echo -e "${ERROR} /boot 中未检测到新增的内核镜像，安装可能未真正生效！"
+		echo -e "${TIP} 请勿重启，先用菜单 [51] 确认当前内核状态。"
+		return 1
+	fi
 
 	echo -e "${INFO} ${kernel_desc} 内核包安装完成，正在更新系统引导..."
 	BBR_grub
@@ -374,6 +530,7 @@ install_kernel_generic() {
 
 # 安装 BBR 原版内核 (调用引擎)
 installbbr() {
+	pre_install_check || return 1
 	local head_url=""
 	local img_url=""
 	local tag_kw=""
@@ -418,25 +575,35 @@ installbbr() {
 
 # 安装 BBRplus 新版内核 (调用引擎)
 installbbrplusnew() {
+	pre_install_check || return 1
 	local head_url=""
 	local img_url=""
 	local tag_kw="bbrplus-6."
 	local ext="deb"
 	local arch_kw="amd64"
+	# Debian 的包名为 linux-image-*，而 RPM 的包名是 kernel-<版本号>，二者必须区分
+	local img_kw="image"
 
-	[[ "${OS_TYPE}" == "CentOS" ]] && ext="rpm"
-	[[ "$OS_ARCH" == "aarch64" ]] && arch_kw="arm64"
+	if [[ "${OS_TYPE}" == "CentOS" ]]; then
+		ext="rpm"
+		arch_kw="x86_64"      # RPM 文件名用 x86_64，沿用 amd64 会过滤为空
+		img_kw="kernel-[0-9]" # 直接匹配 kernel-加数字，从源头避开 headers/devel
+		[[ "$OS_ARCH" == "aarch64" ]] && arch_kw="aarch64"
+	else
+		[[ "$OS_ARCH" == "aarch64" ]] && arch_kw="arm64"
+	fi
 
 	echo -e "${INFO} 正在向 UJX6N/bbrplus-6.x_stable 请求数据..."
 	# 利用精准的参数向下传递
 	head_url=$(get_github_asset "UJX6N/bbrplus-6.x_stable" "${tag_kw}" "headers" "${arch_kw}.*${ext}")
-	img_url=$(get_github_asset "UJX6N/bbrplus-6.x_stable" "${tag_kw}" "image" "${arch_kw}.*${ext}")
+	img_url=$(get_github_asset "UJX6N/bbrplus-6.x_stable" "${tag_kw}" "${img_kw}" "${arch_kw}.*${ext}")
 
 	install_kernel_generic "BBRplus(UJX6N)新版内核" "$head_url" "$img_url"
 }
 
 # 安装 BBRplus 内核 4.14.129 (cx9208版)
 installbbrplus() {
+	pre_install_check || return 1
 	local head_url=""
 	local img_url=""
 
@@ -454,102 +621,243 @@ installbbrplus() {
 	install_kernel_generic "BBRplus 4.14.129" "$head_url" "$img_url"
 }
 
-# 安装 Xanmod 自编译老版本
-installxanmod() {
-	echo -e "${TIP} Xanmod 这个自编译版本不维护了，后续请用官方编译版本，知悉。"
-	local head_url=""
-	local img_url=""
+# =================================================
+#  自动探测 Cloud 内核最高可安装版本 (依赖解析)
+# =================================================
+# 用法: detect_cloud_max <img_url_base> <file1> <file2> ...
+# 原理: pool 中混着 stable/testing/sid/experimental 全部内核，版本号最大 ≠ 能装。
+#       太新的内核依赖独立的 linux-modules-*-cloud-* 包（只存在于其自身发行版源），
+#       并可能要求更新的 linux-base / initramfs-tools / libc6。因此从新到旧逐个
+#       下载 image 包交给 `apt-get install -s` 做模拟安装(真实依赖解析器)，第一个
+#       “干净解析”的版本即当前系统最高可安装版本。
+# 结果写入全局变量 CLOUD_MAX_IDX / CLOUD_MAX_FILE (仍为 -1 / 空 表示无可用版本)
+CLOUD_MAX_IDX=-1
+CLOUD_MAX_FILE=""
+detect_cloud_max() {
+	local img_url_base="$1"
+	shift
+	local versions_array=("$@")
+	CLOUD_MAX_IDX=-1
+	CLOUD_MAX_FILE=""
 
-	if [[ "${OS_TYPE}" == "CentOS" ]]; then
-		if [[ "${OS_VERSION_ID}" == "7" ]]; then
-			head_url="https://github.com/ylx2016/kernel/releases/download/Centos_Kernel_5.15.95-xanmod1_lts_latest_2023.02.24-2159/kernel-headers-5.15.95_xanmod1-1.x86_64.rpm"
-			img_url="https://github.com/ylx2016/kernel/releases/download/Centos_Kernel_5.15.95-xanmod1_lts_latest_2023.02.24-2159/kernel-5.15.95_xanmod1-1.x86_64.rpm"
-		elif [[ "${OS_VERSION_ID}" == "8" ]]; then
-			head_url="https://github.com/ylx2016/kernel/releases/download/Centos_Kernel_5.15.81-xanmod1_lts_C8_latest_2022.12.06-1614/kernel-headers-5.15.81_xanmod1-1.x86_64.rpm"
-			img_url="https://github.com/ylx2016/kernel/releases/download/Centos_Kernel_5.15.81-xanmod1_lts_C8_latest_2022.12.06-1614/kernel-5.15.81_xanmod1-1.x86_64.rpm"
+	local scan_work
+	scan_work=$(mktemp -d /tmp/cloud_kernel_scan.XXXXXX) || return 1
+	trap 'cd /tmp; rm -rf "$scan_work"; trap - RETURN' RETURN
+	cd "$scan_work" || return 1
+
+	for ((i = ${#versions_array[@]} - 1; i >= 0; i--)); do
+		local f="${versions_array[$i]}"
+		echo -e "${INFO} 正在探测候选内核: ${f} ..."
+		if ! safe_wget "${img_url_base}${f}" "probe.deb" >/dev/null 2>&1; then
+			continue
 		fi
-	elif [[ "${OS_TYPE}" == "Debian" && "${OS_ARCH}" == "x86_64" ]]; then
-		head_url="https://github.com/ylx2016/kernel/releases/download/Debian_Kernel_5.15.95-xanmod1_lts_latest_2023.02.24-2210/linux-headers-5.15.95-xanmod1_5.15.95-xanmod1-1_amd64.deb"
-		img_url="https://github.com/ylx2016/kernel/releases/download/Debian_Kernel_5.15.95-xanmod1_lts_latest_2023.02.24-2210/linux-image-5.15.95-xanmod1_5.15.95-xanmod1-1_amd64.deb"
-	else
-		echo -e "${ERROR} 当前架构或系统不支持该 Xanmod 版本！"
-		exit 1
-	fi
+		# 校验是合法 ar 归档，防止半截包造成误判
+		if ! head -c 8 probe.deb | grep -q "!<arch>"; then
+			rm -f probe.deb
+			continue
+		fi
 
-	install_kernel_generic "Xanmod 自编译版" "$head_url" "$img_url"
+		# 必须强制 LC_ALL=C: 下面全部靠 grep apt 的英文输出判断依赖是否可满足，
+		# 在 zh_CN 等非英文 locale 下 apt 输出被翻译，所有 grep 都匹配不到，
+		# 会导致每个版本都被误判为"依赖可干净满足"，本函数彻底失效。
+		local scan_log=$(LC_ALL=C DEBIAN_FRONTEND=noninteractive apt-get install -s --no-install-recommends "./probe.deb" 2>&1)
+		rm -f probe.deb
+
+		local ok=1
+		# 1) 依赖无法满足 / 包破损
+		if echo "$scan_log" | grep -qiE "unmet dependencies|broken packages|E: "; then
+			ok=0
+		fi
+		# 2) 会卸载现有软件包 = 必然冲突
+		if echo "$scan_log" | grep -q "will be REMOVED"; then
+			ok=0
+		fi
+		# 3) 会升级到跨发行版核心基础库 (libc6/base-files/dpkg/systemd) = 硬装，跳过。
+		#    允许升级 linux-base/initramfs-tools 等内核生态包 (当前源内可正常解决)
+		if echo "$scan_log" | grep -q "will be upgraded"; then
+			local upgraded=$(echo "$scan_log" | sed -n '/will be upgraded/,/^[^ ]/p' | tail -n +2)
+			if echo "$upgraded" | grep -qwE "libc6|base-files|dpkg|systemd|systemd-sysv|bash|login|tzdata"; then
+				ok=0
+			fi
+		fi
+
+		if [[ $ok -eq 1 ]]; then
+			CLOUD_MAX_IDX=$i
+			CLOUD_MAX_FILE="$f"
+			echo -e "${GREEN_FONT_PREFIX}  ✓ 该版本依赖可干净满足${FONT_COLOR_SUFFIX}"
+			break
+		else
+			echo -e "${TIP}  ✗ 该版本依赖冲突，已跳过"
+		fi
+	done
+	# 临时目录由 RETURN trap 统一清理
+}
+
+# 由 signed image 包名推导配套的 headers 下载地址
+# 例: linux-image-6.1.0-18-cloud-amd64_6.1.76-1_amd64.deb
+#     -> linux-headers-6.1.0-18-cloud-amd64_6.1.76-1_amd64.deb (位于 pool/main/l/linux/)
+# Headers 缺失会导致后续 brutal / LotSpeed 模块无法编译，故尽量一并安装。
+get_cloud_headers_url() {
+	local img_file="$1"
+	local debarch="$2"
+	local hdr_base="https://deb.debian.org/debian/pool/main/l/linux/"
+
+	# 提取 ABI 版本 (如 6.1.0-18-cloud-amd64)
+	local abi=$(echo "$img_file" | sed -nE "s/^linux-image-(.*-cloud-${debarch})_.*/\1/p")
+	[[ -z "$abi" ]] && return 0
+
+	# 从 pool 目录列表中查找完全匹配该 ABI 的 headers 包
+	local hdr_pattern="linux-headers-${abi}_[^\" ]+_${debarch}\.deb"
+	local hdr_file=$(curl -sL --max-time 10 "$hdr_base" | grep -oE "$hdr_pattern" | sort -V | uniq | tail -n 1)
+
+	if [[ -z "$hdr_file" ]]; then
+		echo -e "${TIP} 未找到与 ${abi} 配套的 Headers，将仅安装内核镜像。" >&2
+		return 0
+	fi
+	echo "${hdr_base}${hdr_file}"
 }
 
 # 安装官方 Cloud 内核
 installcloud() {
+	pre_install_check || return 1
+
 	[[ "${OS_TYPE}" != "Debian" ]] && {
 		echo -e "${ERROR} Cloud 内核仅支持 Debian 系系统"
-		exit 1
+		return 1
 	}
 
-	local img_url_base
-	local img_pattern
+	local debarch
 	if [[ "$OS_ARCH" == "x86_64" ]]; then
-		img_url_base="https://deb.debian.org/debian/pool/main/l/linux-signed-amd64/"
-		img_pattern='linux-image-[^"]+cloud-amd64_[^"]+_amd64\.deb'
+		debarch="amd64"
 	elif [[ "$OS_ARCH" == "aarch64" ]]; then
-		img_url_base="https://deb.debian.org/debian/pool/main/l/linux-signed-arm64/"
-		img_pattern='linux-image-[^"]+cloud-arm64_[^"]+_arm64\.deb'
+		debarch="arm64"
 	else
 		echo -e "${ERROR} 不支持的架构：$OS_ARCH"
-		exit 1
+		return 1
 	fi
+
+	local img_url_base="https://deb.debian.org/debian/pool/main/l/linux-signed-${debarch}/"
+	local img_pattern='linux-image-[^" ]+cloud-'"${debarch}"'_[^" ]+_'"${debarch}"'\.deb'
 
 	echo -e "${INFO} 正在从 Debian 官方源获取 Cloud 内核列表..."
 	local deb_files=$(curl -sL --max-time 10 "$img_url_base" | grep -oE "$img_pattern" | sort -V | uniq)
-
 	if [[ -z "$deb_files" ]]; then
 		echo -e "${ERROR} 未找到可用的 Cloud 内核版本，请检查网络！"
-		exit 1
+		return 1
 	fi
-
-	# 将文件列表转换为数组
 	mapfile -t versions_array <<<"$deb_files"
 
-	echo -e "${INFO} 检测到以下 Cloud 内核版本："
+	# ---- 读取上次记录的最高可安装版本 (用于默认选中与高亮提示) ----
+	local remembered=""
+	[[ -f "$CLOUD_STATE_FILE" ]] && remembered=$(cat "$CLOUD_STATE_FILE" 2>/dev/null)
+	local remembered_idx=-1
+	if [[ -n "$remembered" ]]; then
+		for i in "${!versions_array[@]}"; do
+			[[ "${versions_array[$i]}" == "$remembered" ]] && {
+				remembered_idx=$i
+				break
+			}
+		done
+	fi
+
+	# ---- 展示全部版本 (保持原始行为) ----
+	echo -e "${INFO} 检测到以下 Cloud 内核版本 (pool 全部候选)："
 	for i in "${!versions_array[@]}"; do
-		# 截取版本号用于展示
 		local v_show=$(echo "${versions_array[$i]}" | grep -oE '[0-9]+\.[0-9]+\.[0-9]+-[0-9]+')
-		echo "  $i) [$v_show] -> ${versions_array[$i]}"
+		if [[ $i -eq $remembered_idx ]]; then
+			echo -e "  ${GREEN_FONT_PREFIX}$i) [$v_show]${FONT_COLOR_SUFFIX} ${RED_FONT_PREFIX}← 上次最高可安装版本${FONT_COLOR_SUFFIX} -> ${versions_array[$i]}"
+		else
+			echo "  $i) [$v_show] -> ${versions_array[$i]}"
+		fi
 	done
+	echo -e "  ${GREEN_FONT_PREFIX}a) 自动逐个探测并判断最高可安装版本${FONT_COLOR_SUFFIX}   ${YELLOW_FONT_PREFIX}h) 使用 apt 安装${FONT_COLOR_SUFFIX}"
 
-	local default_idx=$((${#versions_array[@]} - 1))
-	echo -e "${TIP} 请选择要安装的内核版本（10秒后默认选择最新版本，输入 'h' 则使用 apt 安装）："
-	read -t 10 -p "输入选项 [0-$default_idx 或 h]: " choice
+	local last_idx=$((${#versions_array[@]} - 1))
+	local default_idx=$last_idx
+	[[ $remembered_idx -ge 0 ]] && default_idx=$remembered_idx
 
+	local def_label="$default_idx"
+	[[ $remembered_idx -ge 0 ]] && def_label="${default_idx} (上次记忆)"
+	echo -e "${TIP} 输入 'a' 自动判断最高可安装版本，输入 'h' 使用 apt 安装："
+	# 内核安装不可逆，超时一律取消而非自动执行；60 秒留足阅读上面版本列表的时间
+	if ! read -t 60 -rp "输入选项 [0-${last_idx} / a / h / q 取消，回车默认 ${def_label}]: " choice; then
+		echo ""
+		echo -e "${TIP} 等待超时，出于安全考虑已自动取消操作 (未做任何更改)。"
+		return 0
+	fi
+
+	# ---- q: 显式取消 ----
+	if [[ "$choice" =~ ^[qQ]$ ]]; then
+		echo -e "${INFO} 已取消操作。"
+		return 0
+	fi
+
+	# ---- a: 自动逐个尝试判断最高可安装版本 ----
+	if [[ "$choice" =~ ^[aA]$ ]]; then
+		echo -e "${INFO} 开始自动探测最高可安装的 Cloud 内核版本（从新到旧逐个依赖校验）..."
+		detect_cloud_max "$img_url_base" "${versions_array[@]}"
+		if [[ $CLOUD_MAX_IDX -lt 0 || -z "$CLOUD_MAX_FILE" ]]; then
+			echo -e "${TIP} 未找到可干净安装的 pool 版本，已回退到 apt 官方源安装 (最稳妥)。"
+			echo -e "${INFO} 正在使用 apt 安装 Cloud 内核及 Headers..."
+			apt-get update >/dev/null 2>&1
+			apt-get install -y "linux-image-cloud-${debarch}" "linux-headers-cloud-${debarch}"
+			BBR_grub
+			return 0
+		fi
+		# 记忆本次探测结果，下次进入默认选中
+		echo "$CLOUD_MAX_FILE" >"$CLOUD_STATE_FILE"
+		echo -e "${INFO} 探测完成！当前系统最高可安装版本: ${GREEN_FONT_PREFIX}${CLOUD_MAX_FILE}${FONT_COLOR_SUFFIX}，开始安装..."
+		install_kernel_generic "Debian 官方 Cloud" "$(get_cloud_headers_url "$CLOUD_MAX_FILE" "$debarch")" "${img_url_base}${CLOUD_MAX_FILE}"
+		return 0
+	fi
+
+	# ---- h: 直接使用 apt 安装当前发行版云内核 ----
 	if [[ "$choice" =~ ^[hH]$ ]]; then
 		echo -e "${INFO} 正在使用 apt 安装 Cloud 内核及 Headers..."
 		apt-get update >/dev/null 2>&1
-		local arch_ext="amd64"
-		[[ "$OS_ARCH" == "aarch64" ]] && arch_ext="arm64"
-		apt-get install -y "linux-image-cloud-${arch_ext}" "linux-headers-cloud-${arch_ext}"
+		apt-get install -y "linux-image-cloud-${debarch}" "linux-headers-cloud-${debarch}"
 		BBR_grub
 		return 0
 	fi
 
+	# ---- 数字选择或回车默认 ----
 	choice=${choice:-$default_idx}
-	if ! [[ "$choice" =~ ^[0-9]+$ ]] || [ "$choice" -lt 0 ] || [ "$choice" -gt "$default_idx" ]; then
-		echo -e "${TIP} 无效选项，默认安装最新版本..."
+	if ! [[ "$choice" =~ ^[0-9]+$ ]] || [ "$choice" -lt 0 ] || [ "$choice" -gt "$last_idx" ]; then
+		echo -e "${TIP} 无效选项，默认安装 ${default_idx} 号版本..."
 		choice=$default_idx
 	fi
 
 	local selected_file="${versions_array[$choice]}"
-	# 传递给通用引擎（此处无 Headers，留空）
-	install_kernel_generic "Debian 官方 Cloud" "" "${img_url_base}${selected_file}"
+	# 一并抓取配套 Headers，否则装完无法编译 brutal/LotSpeed 模块
+	install_kernel_generic "Debian 官方 Cloud" "$(get_cloud_headers_url "$selected_file" "$debarch")" "${img_url_base}${selected_file}"
 }
 
 # 安装 Lotserver (锐速) 专属内核
 installlot() {
+	pre_install_check || return 1
+
 	[[ "$OS_ARCH" != "x86_64" ]] && {
 		echo -e "${ERROR} Lotserver 仅支持 x86_64 架构！"
-		exit 1
+		return 1
 	}
 
-	remove_old_headers
+	# 上游仅提供 CentOS 6/7 的 Lotserver 内核包，8/9/10 请求的是不存在的路径
+	if [[ "${OS_TYPE}" == "CentOS" && "${OS_VERSION_ID}" != "6" && "${OS_VERSION_ID}" != "7" ]]; then
+		echo -e "${ERROR} Lotserver 内核仅支持 CentOS 6/7，当前为 CentOS ${OS_VERSION_ID}！"
+		return 1
+	fi
+
+	local work_dir
+	work_dir=$(mktemp -d /tmp/lot_install.XXXXXX) || {
+		echo -e "${ERROR} 无法创建临时目录！"
+		return 1
+	}
+	# 无论从哪条路径返回，都保证清理临时目录且回到安全的 CWD
+	trap 'cd /tmp; rm -rf "$work_dir"; trap - RETURN' RETURN
+	cd "$work_dir" || {
+		echo -e "${ERROR} 无法进入临时目录 ${work_dir}！"
+		return 1
+	}
 
 	if [[ "${OS_TYPE}" == "CentOS" ]]; then
 		local lot_ver="4.11.2-1" # CentOS 7 默认
@@ -557,43 +865,61 @@ installlot() {
 
 		local base_url="http://${GITHUB_RAW_URL}/lotserver/centos/${OS_VERSION_ID}/x64"
 
+		# 先把 4 个包全部下载并校验成功，再动系统 (避免删了旧包却没装上新包)
+		local lot_pkgs=(
+			"kernel-firmware-${lot_ver}.rpm|kernel-firmware.rpm"
+			"kernel-${lot_ver}.rpm|kernel.rpm"
+			"kernel-headers-${lot_ver}.rpm|kernel-headers.rpm"
+			"kernel-devel-${lot_ver}.rpm|kernel-devel.rpm"
+		)
+		local item
+		for item in "${lot_pkgs[@]}"; do
+			local remote="${item%%|*}"
+			local local_f="${item##*|}"
+			if ! safe_wget "${base_url}/${remote}" "$local_f"; then
+				echo -e "${ERROR} Lotserver 组件 ${remote} 下载失败，已中止 (系统未做任何更改)。"
+				return 1
+			fi
+		done
+
 		rpm --import "http://${GITHUB_RAW_URL}/lotserver/centos/RPM-GPG-KEY-elrepo.org" >/dev/null 2>&1
+		remove_old_headers
 		yum remove -y kernel-firmware kernel-headers >/dev/null 2>&1
 
-		# 使用 safe_wget 增强下载稳定性
-		local work_dir="/tmp/lot_install"
-		mkdir -p "$work_dir" && cd "$work_dir"
-
-		safe_wget "${base_url}/kernel-firmware-${lot_ver}.rpm" "kernel-firmware.rpm"
-		safe_wget "${base_url}/kernel-${lot_ver}.rpm" "kernel.rpm"
-		safe_wget "${base_url}/kernel-headers-${lot_ver}.rpm" "kernel-headers.rpm"
-		safe_wget "${base_url}/kernel-devel-${lot_ver}.rpm" "kernel-devel.rpm"
-
 		echo -e "${INFO} 正在安装 Lotserver 专属内核组件..."
-		yum install -y *.rpm
-		cd /tmp && rm -rf "$work_dir"
+		# 显式列出文件名，避免下载失败时把字面量 *.rpm 传给 yum
+		if ! yum install -y ./kernel-firmware.rpm ./kernel.rpm ./kernel-headers.rpm ./kernel-devel.rpm; then
+			echo -e "${ERROR} Lotserver 内核安装失败！"
+			return 1
+		fi
 
 	elif [[ "${OS_TYPE}" == "Debian" ]]; then
 		# Debian/Ubuntu 走老旧的 snapshot.debian.org 源
-		apt-get autoremove -y >/dev/null 2>&1
-		local work_dir="/tmp/lot_install"
-		mkdir -p "$work_dir" && cd "$work_dir"
-
+		local base_deb="" img_deb=""
 		if [[ "$OS_ID" == "debian" && "$OS_VERSION_ID" == "8" ]]; then
-			safe_wget "http://snapshot.debian.org/archive/debian/20120304T220938Z/pool/main/l/linux-base/linux-base_3.5_all.deb" "linux-base.deb"
-			safe_wget "http://snapshot.debian.org/archive/debian/20171008T163152Z/pool/main/l/linux/linux-image-3.16.0-4-amd64_3.16.43-2+deb8u5_amd64.deb" "linux-image.deb"
+			base_deb="http://snapshot.debian.org/archive/debian/20120304T220938Z/pool/main/l/linux-base/linux-base_3.5_all.deb"
+			img_deb="http://snapshot.debian.org/archive/debian/20171008T163152Z/pool/main/l/linux/linux-image-3.16.0-4-amd64_3.16.43-2+deb8u5_amd64.deb"
 		elif [[ "$OS_ID" == "debian" && "$OS_VERSION_ID" == "9" ]]; then
-			safe_wget "http://snapshot.debian.org/archive/debian/20160917T042239Z/pool/main/l/linux-base/linux-base_4.5_all.deb" "linux-base.deb"
-			safe_wget "http://snapshot.debian.org/archive/debian/20171224T175424Z/pool/main/l/linux/linux-image-4.9.0-4-amd64_4.9.65-3+deb9u1_amd64.deb" "linux-image.deb"
+			base_deb="http://snapshot.debian.org/archive/debian/20160917T042239Z/pool/main/l/linux-base/linux-base_4.5_all.deb"
+			img_deb="http://snapshot.debian.org/archive/debian/20171224T175424Z/pool/main/l/linux/linux-image-4.9.0-4-amd64_4.9.65-3+deb9u1_amd64.deb"
 		else
 			echo -e "${ERROR} Lotserver 不支持当前系统版本！"
-			exit 1
+			return 1
 		fi
 
-		dpkg -l | grep -q 'linux-base' || dpkg -i linux-base.deb
-		dpkg -i linux-image.deb
-		apt-get install -f -y
-		cd /tmp && rm -rf "$work_dir"
+		if ! safe_wget "$base_deb" "linux-base.deb" || ! safe_wget "$img_deb" "linux-image.deb"; then
+			echo -e "${ERROR} Lotserver 内核组件下载失败，已中止 (系统未做任何更改)。"
+			return 1
+		fi
+
+		apt-get autoremove -y >/dev/null 2>&1
+		remove_old_headers
+
+		dpkg-query -W -f='${Status}' linux-base 2>/dev/null | grep -q "install ok installed" || dpkg -i linux-base.deb
+		if ! apt-get install -y --allow-downgrades ./linux-image.deb; then
+			echo -e "${ERROR} Lotserver 内核安装失败！"
+			return 1
+		fi
 	fi
 
 	echo -e "${INFO} Lotserver 内核包安装完成，正在更新系统引导..."
@@ -618,6 +944,15 @@ optimizing_system() {
 	local current_qdisc=$(cat /proc/sys/net/core/default_qdisc 2>/dev/null || echo "fq")
 	[[ "$current_cc" == "unknown" || -z "$current_cc" ]] && current_cc="bbr"
 	[[ "$current_qdisc" == "unknown" || -z "$current_qdisc" ]] && current_qdisc="fq"
+
+	# 同理继承当前 IPv6 开关状态。
+	# 否则用户先执行 [35] 禁用 IPv6、再执行 [32] 网络优化时，
+	# 本函数会无条件写回 disable_ipv6 = 0，把 IPv6 静默重新打开。
+	local current_disable_ipv6=$(cat /proc/sys/net/ipv6/conf/all/disable_ipv6 2>/dev/null || echo "0")
+	[[ "$current_disable_ipv6" != "1" ]] && current_disable_ipv6="0"
+	if [[ "$current_disable_ipv6" == "1" ]]; then
+		echo -e "${TIP} 检测到当前已禁用 IPv6，本次优化将保持该状态 (如需开启请用菜单 [36])。"
+	fi
 
 	# 2. 根据内存大小动态适配网络缓存与文件描述符
 	local tcp_mem_max somaxconn file_max
@@ -712,8 +1047,8 @@ net.ipv4.conf.default.forwarding = 1
 net.ipv6.conf.all.forwarding = 1
 net.ipv6.conf.default.forwarding = 1
 net.ipv6.conf.lo.forwarding = 1
-net.ipv6.conf.all.disable_ipv6 = 0
-net.ipv6.conf.default.disable_ipv6 = 0
+net.ipv6.conf.all.disable_ipv6 = $current_disable_ipv6
+net.ipv6.conf.default.disable_ipv6 = $current_disable_ipv6
 
 # --- 默认拥塞控制 (动态继承) ---
 net.core.default_qdisc = $current_qdisc
@@ -775,7 +1110,8 @@ EOF
 
 	# 7. 应用内核与系统参数
 	echo -e "${INFO} 正在应用自适应内核配置..."
-	sysctl -p "$sysctl_conf" >/dev/null 2>&1
+	# sysctl --system 会按序加载 /etc/sysctl.d/ 下全部文件(含本文件)，
+	# 前面单独的 sysctl -p "$sysctl_conf" 属于重复执行，已移除。
 	sysctl --system >/dev/null 2>&1
 
 	# 启用透明大页加速 (如果支持)
@@ -798,7 +1134,6 @@ remove_bbr_lotserver() {
 	[[ -f "/etc/sysctl.conf" ]] && sed -i '/net.core.default_qdisc/d; /net.ipv4.tcp_congestion_control/d; /net.ipv4.tcp_ecn/d' /etc/sysctl.conf
 
 	sysctl --system >/dev/null 2>&1
-	rm -rf bbrmod
 
 	# 修改：停用并卸载 LotSpeed 模块 (但不物理删除文件，以便随时通过菜单快速切换)
 	if command -v lotspeed >/dev/null 2>&1; then
@@ -811,7 +1146,12 @@ remove_bbr_lotserver() {
 	fi
 
 	if [[ -e /appex/bin/lotServer.sh ]]; then
-		echo | bash <(wget -qO- https://raw.githubusercontent.com/fei5seven/lotServer/master/lotServerInstall.sh) uninstall >/dev/null 2>&1
+		local tmp_lot
+		tmp_lot=$(mktemp /tmp/lotserver.XXXXXX)
+		if fetch_remote_script "https://raw.githubusercontent.com/fei5seven/lotServer/master/lotServerInstall.sh" "$tmp_lot" >/dev/null 2>&1; then
+			echo | bash "$tmp_lot" uninstall >/dev/null 2>&1
+		fi
+		rm -f "$tmp_lot"
 	fi
 }
 
@@ -840,11 +1180,24 @@ startlotserver() {
 	else
 		apt-get update && apt-get install ethtool -y
 	fi
-	echo | bash <(wget --no-check-certificate -qO- https://raw.githubusercontent.com/fei5seven/lotServer/master/lotServerInstall.sh) install
+
+	local tmp_lot
+	tmp_lot=$(mktemp /tmp/lotserver.XXXXXX) || return 1
+	if ! fetch_remote_script "https://raw.githubusercontent.com/fei5seven/lotServer/master/lotServerInstall.sh" "$tmp_lot"; then
+		rm -f "$tmp_lot"
+		echo -e "${ERROR} lotServer 安装脚本下载失败！"
+		return 1
+	fi
+	echo | bash "$tmp_lot" install
+	rm -f "$tmp_lot"
+
+	if [[ ! -f /appex/etc/config ]]; then
+		echo -e "${ERROR} lotServer 安装失败，未生成配置文件 /appex/etc/config！"
+		return 1
+	fi
 	sed -i '/advinacc/d; /maxmode/d' /appex/etc/config
 	echo -e "advinacc=\"1\"\nmaxmode=\"1\"" >>/appex/etc/config
 	/appex/bin/lotServer.sh restart
-	start_menu
 }
 
 # 开启/关闭 ECN (显式控制)
@@ -885,22 +1238,52 @@ remove_all() {
 BBR_grub() {
 	echo -e "${INFO} 正在更新系统引导..."
 	if [[ "${OS_TYPE}" == "CentOS" ]]; then
-		# 现代 CentOS 优先使用 grubby 设置最新内核为默认
 		if command -v grubby >/dev/null 2>&1; then
-			local latest_kernel=$(grubby --info=ALL | awk -F= '/^kernel/{print $2}' | head -n 1)
-			[[ -n "$latest_kernel" ]] && grubby --set-default="$latest_kernel" >/dev/null 2>&1
+			# grubby 在 BLS (RHEL/CentOS 8-10) 和传统 GRUB2 下均可用。
+			# 用 gsub 去掉 RHEL 9 输出中可能带的引号，再按版本号排序取最新内核，
+			# 避免依赖 index 顺序 (index=0 是当前默认，不一定是版本最新的)。
+			local latest_kernel
+			latest_kernel=$(grubby --info=ALL |
+				awk -F= '/^kernel/{gsub(/"/,"",$2); print $2}' |
+				sort -V | tail -n 1)
+			if [[ -n "$latest_kernel" ]]; then
+				grubby --set-default="$latest_kernel" >/dev/null 2>&1
+				echo -e "${INFO} 默认启动内核已更新为: ${latest_kernel##*/}"
+			else
+				echo -e "${TIP} grubby 未找到内核条目，回退到 grub2-mkconfig..."
+				_bbr_grub2_mkconfig
+			fi
 		else
-			[[ -f /boot/grub2/grub.cfg ]] && grub2-mkconfig -o /boot/grub2/grub.cfg >/dev/null 2>&1
-			grub2-set-default 0
+			_bbr_grub2_mkconfig
 		fi
 	elif [[ "${OS_TYPE}" == "Debian" ]]; then
-		if command -v update-grub >/dev/null 2>&1; then
+		# systemd-boot: deb 包的 postinst 钩子 (kernel-install) 已自动更新引导条目，
+		# 此处只需将 systemd-boot 加载器二进制本身更新到最新即可，无需操作 GRUB。
+		if command -v bootctl >/dev/null 2>&1 && bootctl is-installed 2>/dev/null; then
+			echo -e "${INFO} 检测到 systemd-boot，引导条目已由包管理器钩子自动处理。"
+			bootctl update >/dev/null 2>&1 || true
+		elif command -v update-grub >/dev/null 2>&1; then
 			update-grub >/dev/null 2>&1
 		else
 			apt-get install -y grub2-common >/dev/null 2>&1
 			update-grub >/dev/null 2>&1
 		fi
 	fi
+}
+
+# grub2-mkconfig 回退辅助函数 (UEFI 优先，再 BIOS legacy)
+_bbr_grub2_mkconfig() {
+	local grub_cfg=""
+	# UEFI: /boot/efi/EFI/<distro>/grub.cfg
+	if [[ -d /boot/efi/EFI ]]; then
+		grub_cfg=$(find /boot/efi/EFI -maxdepth 2 -name grub.cfg 2>/dev/null | head -n 1)
+	fi
+	# BIOS legacy fallback
+	[[ -z "$grub_cfg" && -f /boot/grub2/grub.cfg ]] && grub_cfg="/boot/grub2/grub.cfg"
+	if [[ -n "$grub_cfg" ]]; then
+		grub2-mkconfig -o "$grub_cfg" >/dev/null 2>&1
+	fi
+	grub2-set-default 0
 }
 
 # 查看已安装的内核与排序
@@ -922,8 +1305,7 @@ show_kernels() {
 	echo -e "${INFO} ==================================================="
 	echo -e "${TIP} 当前实际正在运行的内核: ${GREEN_FONT_PREFIX}$(uname -r)${FONT_COLOR_SUFFIX}"
 	echo ""
-	read -p "按回车键返回主菜单..."
-	start_menu
+	return 0
 }
 
 # 高级交互式内核管理 (精准多选删除，支持删除当前内核)
@@ -943,8 +1325,6 @@ delete_kernel_custom() {
 
 	if [[ ${#kernel_list[@]} -eq 0 ]]; then
 		echo -e "${ERROR} 未检测到可管理的内核包。"
-		sleep 2
-		start_menu
 		return
 	fi
 
@@ -967,8 +1347,6 @@ delete_kernel_custom() {
 
 	if [[ -z "$del_choices" ]]; then
 		echo -e "${INFO} 已取消操作，返回主菜单。"
-		sleep 2
-		start_menu
 		return
 	fi
 
@@ -990,9 +1368,26 @@ delete_kernel_custom() {
 
 	if [[ -z "$pkgs_to_del" ]]; then
 		echo -e "${INFO} 没有选择有效的内核，操作结束。"
-		sleep 2
-		start_menu
 		return
+	fi
+
+	# 安全屏障：确保删除后至少还剩一个可引导内核镜像，防止变砖
+	local remaining_images=0
+	for pkg in "${kernel_list[@]}"; do
+		# 仅统计镜像包 (跳过 headers / modules / devel)
+		if [[ "${OS_TYPE}" == "Debian" ]]; then
+			[[ "$pkg" != linux-image-* ]] && continue
+		else
+			# CentOS: kernel(-ml|-lt|…)-<版本号> 格式，排除 headers/devel
+			[[ ! "$pkg" =~ ^kernel(-ml|-lt|-uek|-rt|-plus)?-[0-9] ]] && continue
+		fi
+		# 该镜像不在待删除列表中 → 会被保留
+		[[ " $pkgs_to_del " != *" $pkg "* ]] && ((remaining_images++))
+	done
+	if [[ $remaining_images -eq 0 ]]; then
+		echo -e "${ERROR} 操作已阻止！删除所选包后系统将无任何可引导内核，重启即变砖！"
+		echo -e "${TIP} 请至少保留一个可引导内核镜像包。"
+		return 1
 	fi
 
 	echo -e "${TIP} 即将从系统中彻底卸载以下内核包:"
@@ -1007,16 +1402,12 @@ delete_kernel_custom() {
 		read -p "您确定要继续删除选中的内核包吗？(请输入大写的 YES 确认): " confirm_danger
 		if [[ "$confirm_danger" != "YES" ]]; then
 			echo -e "${INFO} 操作已取消，出于安全考虑未执行删除。"
-			sleep 2
-			start_menu
 			return
 		fi
 	else
 		read -p "请确认是否卸载？(Y/n): " confirm
 		if [[ "$confirm" =~ ^[nN]$ ]]; then
 			echo -e "${INFO} 操作已取消。"
-			sleep 2
-			start_menu
 			return
 		fi
 	fi
@@ -1031,30 +1422,40 @@ delete_kernel_custom() {
 
 	BBR_grub
 	echo -e "${INFO} 指定内核卸载完毕！引导项已自动更新。"
-	sleep 2
-	start_menu
 }
 
 # 编译安装 brutal
 startbrutal() {
+	# headers_status 由 check_status 填充。在此处主动刷新，
+	# 避免依赖菜单循环是否已调用过 check_status 的不确定状态。
+	check_status
 	if [[ "$headers_status" == "已匹配" ]]; then
 		echo -e "${INFO} Headers 已匹配，开始编译 Brutal..."
 		bash <(curl -fsSL https://tcp.hy2.sh/)
 		if lsmod | grep -q "brutal"; then
 			echo -e "${INFO} Brutal 模块已成功加载！"
 		else
-			echo -e "${ERROR} Brutal 模块未加载，编译可能失败。"
+			echo -e "${ERROR} Brutal 模块未加载，编译可能失败，请查看上方日志。"
 		fi
 	else
-		echo -e "${ERROR} 当前内核 Headers 不匹配或者未安装，无法编译。"
+		echo -e "${ERROR} 当前内核 Headers 不匹配或未安装，无法编译 Brutal。"
+		echo -e "${TIP} 请先安装对应版本的 Headers (通常随内核包一并安装，也可重新执行安装菜单)。"
 	fi
 }
 
 # 安装启用 LotSpeed (uk0开发)
 install_lotspeed() {
 	echo -e "${INFO} 准备安装并启用 LotSpeed (ml-tcp 分支) ..."
-	# 执行官方一键安装脚本
-	bash <(curl -fsSL https://raw.githubusercontent.com/uk0/lotspeed/ml-tcp/install.sh)
+	# 执行官方一键安装脚本 (走 safe_wget 以便国内机可通过镜像获取)
+	local tmp_ls
+	tmp_ls=$(mktemp /tmp/lotspeed.XXXXXX) || return 1
+	if ! fetch_remote_script "https://raw.githubusercontent.com/uk0/lotspeed/ml-tcp/install.sh" "$tmp_ls"; then
+		rm -f "$tmp_ls"
+		echo -e "${ERROR} LotSpeed 安装脚本下载失败！"
+		return 1
+	fi
+	bash "$tmp_ls"
+	rm -f "$tmp_ls"
 
 	if lsmod | grep -q "lotspeed"; then
 		echo -e "${INFO} LotSpeed 模块已成功加载！"
@@ -1093,28 +1494,91 @@ enable_lotspeed_standalone() {
 # =================================================
 #  杂项与附加功能模块 (补齐缺失的函数)
 # =================================================
-Update_Shell() {
-	echo -e "${INFO} 正在更新脚本..."
-	wget -O tcpx.sh "https://raw.githubusercontent.com/ylx2016/Linux-NetSpeed/master/tcpx.sh" && chmod +x tcpx.sh && ./tcpx.sh
-	exit 0
+
+# 通用的远程脚本获取器: 下载到临时文件 -> 校验 -> 交给调用方处理
+# 统一走 safe_wget，国内机才能借助镜像拿到 raw.githubusercontent.com 上的内容
+fetch_remote_script() {
+	local url="$1"
+	local dest="$2"
+
+	safe_wget "$url" "$dest" || return 1
+
+	# 校验：非空 + 是 shell 脚本 (防止把 404 页面/运营商劫持页当脚本执行)
+	if [[ ! -s "$dest" ]]; then
+		echo -e "${ERROR} 下载到的文件为空！"
+		return 1
+	fi
+	if ! head -n 1 "$dest" | grep -qE '^#!.*(bash|sh)'; then
+		echo -e "${ERROR} 下载到的内容不是有效的 Shell 脚本 (可能是错误页或被劫持)！"
+		return 1
+	fi
+	return 0
 }
 
-gototcp() {
-	echo -e "${INFO} 正在切换到卸载内核版本..."
-	wget -O tcp.sh "https://raw.githubusercontent.com/ylx2016/Linux-NetSpeed/master/tcp.sh" && chmod +x tcp.sh && ./tcp.sh
-	exit 0
+Update_Shell() {
+	echo -e "${INFO} 正在更新脚本..."
+
+	# 关键: 绝不能直接 wget -O 覆盖正在运行的脚本文件。
+	# bash 是边读边执行的，覆写自身会导致后续语句从错误的字节偏移继续解析。
+	# 正确做法是先下到临时文件、校验通过后再 mv 覆盖，最后 exec 重启。
+	local tmp_sh
+	tmp_sh=$(mktemp /tmp/tcpx_update.XXXXXX) || {
+		echo -e "${ERROR} 无法创建临时文件！"
+		return 1
+	}
+
+	if ! fetch_remote_script "${GITHUB_RAW_URL}/tcpx.sh" "$tmp_sh"; then
+		rm -f "$tmp_sh"
+		echo -e "${ERROR} 脚本更新失败，已保留当前版本 (未做任何更改)。"
+		return 1
+	fi
+
+	# 解析目标位置：优先覆盖当前脚本自身
+	local self_path
+	self_path=$(readlink -f "$0" 2>/dev/null || echo "$0")
+	if [[ ! -w "$(dirname "$self_path")" ]]; then
+		echo -e "${TIP} 当前脚本所在目录不可写，将安装到 /root/tcpx.sh"
+		self_path="/root/tcpx.sh"
+	fi
+
+	local new_ver=$(grep -m1 '^readonly SH_VER=' "$tmp_sh" | cut -d'"' -f2)
+	if [[ -n "$new_ver" ]]; then
+		if [[ "$new_ver" == "$SH_VER" ]]; then
+			echo -e "${INFO} 当前已是最新版本 [v${SH_VER}]，无需更新。"
+			rm -f "$tmp_sh"
+			return 0
+		fi
+		echo -e "${INFO} 发现新版本: ${GREEN_FONT_PREFIX}v${new_ver}${FONT_COLOR_SUFFIX} (当前 v${SH_VER})"
+	fi
+
+	mv -f "$tmp_sh" "$self_path" || {
+		rm -f "$tmp_sh"
+		echo -e "${ERROR} 写入 ${self_path} 失败！"
+		return 1
+	}
+	chmod +x "$self_path"
+
+	echo -e "${INFO} 更新完成，正在重新载入脚本..."
+	exec bash "$self_path"
 }
 
 gotodd() {
 	echo -e "${INFO} 正在切换到一键 DD 系统脚本..."
-	wget -qO- "https://raw.githubusercontent.com/bin456789/reinstall/main/reinstall.sh" | bash
-	exit 0
+	local tmp_sh
+	tmp_sh=$(mktemp /tmp/reinstall.XXXXXX) || return 1
+
+	if ! fetch_remote_script "https://raw.githubusercontent.com/bin456789/reinstall/main/reinstall.sh" "$tmp_sh"; then
+		rm -f "$tmp_sh"
+		echo -e "${ERROR} reinstall.sh 下载失败！"
+		return 1
+	fi
+	bash "$tmp_sh"
+	rm -f "$tmp_sh"
 }
 
 gotoipcheck() {
 	echo -e "${INFO} 正在下载并运行流媒体/IP检测脚本..."
 	bash <(curl -L -s check.unlock.media)
-	exit 0
 }
 
 closeipv6() {
@@ -1170,11 +1634,11 @@ get_system_info() {
 }
 
 # 开始菜单
-start_menu() {
+# 绘制菜单与状态面板 (不含读取输入，便于循环复用)
+show_menu_panel() {
 	clear
 	echo && echo -e " TCP加速 一键安装管理脚本 ${RED_FONT_PREFIX}[v${SH_VER}] 不卸内核${FONT_COLOR_SUFFIX} from blog.ylx.me 母鸡慎用
  ${GREEN_FONT_PREFIX}0.${FONT_COLOR_SUFFIX} 升级脚本
- ${GREEN_FONT_PREFIX}91.${FONT_COLOR_SUFFIX} 切换到卸载内核版本
  ———————————————————————————— 内核安装 —————————————————————————————
  ${GREEN_FONT_PREFIX}1.${FONT_COLOR_SUFFIX} 安装 BBR自编编译内核     ${GREEN_FONT_PREFIX}7.${FONT_COLOR_SUFFIX} 安装 官方稳定内核
  ${GREEN_FONT_PREFIX}2.${FONT_COLOR_SUFFIX} 安装 BBRplus版内核       ${GREEN_FONT_PREFIX}8.${FONT_COLOR_SUFFIX} 安装 官方最新内核
@@ -1183,7 +1647,7 @@ start_menu() {
  ${GREEN_FONT_PREFIX}5.${FONT_COLOR_SUFFIX} 安装 BBRplus新版内核     ${GREEN_FONT_PREFIX}11.${FONT_COLOR_SUFFIX} 安装 XANMOD(EDGE)
  ${GREEN_FONT_PREFIX}6.${FONT_COLOR_SUFFIX} 安装 Zen官方版内核       ${GREEN_FONT_PREFIX}12.${FONT_COLOR_SUFFIX} 安装 XANMOD(RT)
  ———————————————————————————— 加速启用 —————————————————————————————
- ${GREEN_FONT_PREFIX}20.${FONT_COLOR_SUFFIX} 使用BBR+FQ加速          ${GREEN_FONT_PREFIX}21.${FONT_COLOR_SUFFIX} 使用BBR+FQ_PIE加速 
+ ${GREEN_FONT_PREFIX}20.${FONT_COLOR_SUFFIX} 使用BBR+FQ加速          ${GREEN_FONT_PREFIX}21.${FONT_COLOR_SUFFIX} 使用BBR+FQ_PIE加速
  ${GREEN_FONT_PREFIX}22.${FONT_COLOR_SUFFIX} 使用BBR+CAKE加速        ${GREEN_FONT_PREFIX}23.${FONT_COLOR_SUFFIX} 使用BBRplus+FQ版加速
  ${GREEN_FONT_PREFIX}24.${FONT_COLOR_SUFFIX} 使用Lotserver(锐速)加速 ${GREEN_FONT_PREFIX}25.${FONT_COLOR_SUFFIX} 编译安装brutal模块
  ${GREEN_FONT_PREFIX}26.${FONT_COLOR_SUFFIX} 编译安装LotSpeed模块    ${GREEN_FONT_PREFIX}27.${FONT_COLOR_SUFFIX} 使用LotSpeed加速
@@ -1194,7 +1658,9 @@ start_menu() {
  ${GREEN_FONT_PREFIX}37.${FONT_COLOR_SUFFIX} 手动提交合并内核参数    ${GREEN_FONT_PREFIX}38.${FONT_COLOR_SUFFIX} 手动编辑内核参数
  ———————————————————————————— 内核管理 —————————————————————————————
  ${GREEN_FONT_PREFIX}51.${FONT_COLOR_SUFFIX} 查看排序内核            ${GREEN_FONT_PREFIX}52.${FONT_COLOR_SUFFIX} 删除保留指定内核
- ${GREEN_FONT_PREFIX}55.${FONT_COLOR_SUFFIX} 卸载全部加速            ${GREEN_FONT_PREFIX}99.${FONT_COLOR_SUFFIX} 退出脚本 
+ ${GREEN_FONT_PREFIX}55.${FONT_COLOR_SUFFIX} 卸载全部加速            ${GREEN_FONT_PREFIX}99.${FONT_COLOR_SUFFIX} 退出脚本
+ ———————————————————————————— 其它工具 —————————————————————————————
+ ${GREEN_FONT_PREFIX}60.${FONT_COLOR_SUFFIX} 流媒体/IP解锁检测       ${GREEN_FONT_PREFIX}92.${FONT_COLOR_SUFFIX} 一键DD重装系统
 ————————————————————————————————————————————————————————————————"
 	check_status
 	get_system_info
@@ -1205,52 +1671,72 @@ start_menu() {
 		echo -e " 状态: ${GREEN_FONT_PREFIX}已安装${FONT_COLOR_SUFFIX} ${RED_FONT_PREFIX}${kernel_status}${FONT_COLOR_SUFFIX} 加速内核 , ${GREEN_FONT_PREFIX}${run_status}${FONT_COLOR_SUFFIX} ${RED_FONT_PREFIX}${brutal}${FONT_COLOR_SUFFIX} ${RED_FONT_PREFIX}${lotspeed_status}${FONT_COLOR_SUFFIX}"
 	fi
 	echo -e " 拥塞控制算法: ${GREEN_FONT_PREFIX}${net_congestion_control}${FONT_COLOR_SUFFIX} 队列算法: ${GREEN_FONT_PREFIX}${net_qdisc}${FONT_COLOR_SUFFIX} Headers状态：${GREEN_FONT_PREFIX}${headers_status}${FONT_COLOR_SUFFIX}"
+}
 
-	read -p " 请输入数字 :" num
-	case "$num" in
-	0) Update_Shell ;;
-	1) installbbr ;;
-	2) installbbrplus ;;
-	3) installlot ;;
-	4) installcloud ;;
-	5) installbbrplusnew ;;
-	6) check_sys_official_zen ;;
-	7) check_sys_official ;;
-	8) check_sys_official_bbr ;;
-	9) check_sys_official_xanmod_main ;;
-	10) check_sys_official_xanmod_lts ;;
-	11) check_sys_official_xanmod_edge ;;
-	12) check_sys_official_xanmod_rt ;;
-	20) enable_acceleration "fq" "bbr" ;;
-	21) enable_acceleration "fq_pie" "bbr" ;;
-	22) enable_acceleration "cake" "bbr" ;;
-	23) enable_acceleration "fq" "bbrplus" ;;
-	24) startlotserver ;;
-	25) startbrutal ;;
-	26) install_lotspeed ;;
-	27) enable_lotspeed_standalone ;;
-	30) set_ecn "1" ;;
-	31) set_ecn "0" ;;
-	32) optimizing_system ;;
-	33) optimizing_ddcc ;;
-	35) closeipv6 ;;
-	36) openipv6 ;;
-	37) update_sysctl_interactive ;;
-	38) edit_sysctl_interactive ;;
-	51) show_kernels ;;
-	52) delete_kernel_custom ;;
-	55) remove_all ;;
-	60) gotoipcheck ;;
-	91) gototcp ;;
-	92) gotodd ;;
-	99) exit 1 ;;
-	*)
-		clear
-		echo -e "${ERROR}: 请输入正确数字"
-		sleep 3s
-		start_menu
-		;;
-	esac
+# 开始菜单 (改为循环驱动)
+# 原实现里各功能函数末尾靠递归调用 start_menu 回到菜单，存在两个问题:
+#   1) 递归会不断累积调用栈，且大多数分支根本没有递归，执行完就直接退出脚本；
+#   2) 安装函数里的 exit 会连带杀掉整个交互式脚本。
+# 现统一由本循环驱动，功能函数只需 return。
+start_menu() {
+	while true; do
+		show_menu_panel
+
+		# 用 read 的返回值捕获 EOF (Ctrl-D)，否则会陷入空输入死循环
+		if ! read -rp " 请输入数字 :" num; then
+			echo ""
+			echo -e "${INFO} 已退出。"
+			exit 0
+		fi
+
+		case "$num" in
+		0) Update_Shell ;;
+		1) installbbr ;;
+		2) installbbrplus ;;
+		3) installlot ;;
+		4) installcloud ;;
+		5) installbbrplusnew ;;
+		6) check_sys_official_zen ;;
+		7) check_sys_official ;;
+		8) check_sys_official_bbr ;;
+		9) check_sys_official_xanmod_main ;;
+		10) check_sys_official_xanmod_lts ;;
+		11) check_sys_official_xanmod_edge ;;
+		12) check_sys_official_xanmod_rt ;;
+		20) enable_acceleration "fq" "bbr" ;;
+		21) enable_acceleration "fq_pie" "bbr" ;;
+		22) enable_acceleration "cake" "bbr" ;;
+		23) enable_acceleration "fq" "bbrplus" ;;
+		24) startlotserver ;;
+		25) startbrutal ;;
+		26) install_lotspeed ;;
+		27) enable_lotspeed_standalone ;;
+		30) set_ecn "1" ;;
+		31) set_ecn "0" ;;
+		32) optimizing_system ;;
+		33) optimizing_ddcc ;;
+		35) closeipv6 ;;
+		36) openipv6 ;;
+		37) update_sysctl_interactive ;;
+		38) edit_sysctl_interactive ;;
+		51) show_kernels ;;
+		52) delete_kernel_custom ;;
+		55) remove_all ;;
+		60) gotoipcheck ;;
+		92) gotodd ;;
+		99)
+			echo -e "${INFO} 已退出。"
+			exit 0
+			;;
+		*)
+			echo -e "${ERROR}: 请输入正确数字"
+			;;
+		esac
+
+		# 统一在此暂停，让用户看清上面命令的输出后再刷新菜单
+		echo ""
+		read -rp "按回车键返回主菜单..." _ || exit 0
+	done
 }
 
 #-----------------------------------------------------------------------
@@ -1260,7 +1746,10 @@ start_menu() {
 #-----------------------------------------------------------------------
 update_sysctl_interactive() {
 	# 强制使用C语言环境，确保正则表达式的行为可预测且一致。
+	# 注意: 必须 export，否则 sed/grep/sysctl 等子进程根本看不到这个变量，
+	# 仅 local 声明等于完全没生效。
 	local LC_ALL=C
+	export LC_ALL
 
 	# --- 配置与参数解析 ---
 	local CONF_FILE="/etc/sysctl.d/99-sysctl.conf"
@@ -1268,7 +1757,7 @@ update_sysctl_interactive() {
 	local BACKUP_FILE
 	local ignore_apply_error=true
 
-	# --- 帮助函数 ---
+	# --- 帮助函数 (仅本函数内部使用，退出前会 unset 以免污染全局命名空间) ---
 	log_info() {
 		echo "[INFO] $1"
 	}
@@ -1280,6 +1769,9 @@ update_sysctl_interactive() {
 	log_warn() {
 		echo "[WARN] $1" >&2
 	}
+
+	# 函数返回时清理这三个临时函数定义
+	trap 'unset -f log_info log_error log_warn 2>/dev/null' RETURN
 
 	# --- 主逻辑 ---
 
@@ -1311,7 +1803,8 @@ update_sysctl_interactive() {
 		log_error "无法创建临时文件"
 		return 1
 	}
-	trap 'rm -f "$TMP_FILE"' RETURN
+	# 覆盖上面的 RETURN trap，追加临时文件清理 (bash 每个信号只保留一个 trap)
+	trap 'rm -f "$TMP_FILE"; unset -f log_info log_error log_warn 2>/dev/null' RETURN
 
 	cp "$CONF_FILE" "$TMP_FILE"
 
@@ -1377,7 +1870,8 @@ update_sysctl_interactive() {
 	mv "$TMP_FILE" "$CONF_FILE"
 	chown root:root "$CONF_FILE"
 	chmod 644 "$CONF_FILE"
-	trap - RETURN
+	# TMP_FILE 已被 mv 走，无需再清理，但仍需在返回时收回临时函数定义
+	trap 'unset -f log_info log_error log_warn 2>/dev/null' RETURN
 
 	# 7. 应用配置并进行错误处理
 	log_info "正在应用新的 sysctl 设置..."
@@ -1420,75 +1914,52 @@ edit_sysctl_interactive() {
 	local editor_cmd=""
 
 	# --- 1. 检查文件是否存在 ---
-	if [ ! -f "$target_file" ]; then
-		echo "文件 $target_file 不存在。"
-		# (Y/n) 格式，n/N 以外的任何输入（包括回车）都将继续
-		read -r -p "您想现在创建并编辑它吗？ (Y/n): " create_choice
-
+	if [[ ! -f "$target_file" ]]; then
+		echo -e "${TIP} 文件 $target_file 不存在。"
+		read -r -p "是否立即创建并编辑？ (Y/n): " create_choice
 		case "$create_choice" in
 		[nN])
-			echo "操作已取消。"
-			return 0 # 0 表示成功（用户主动取消）
+			echo -e "${INFO} 操作已取消。"
+			return 0
 			;;
-		*)
-			echo "好的，准备创建并打开编辑器..."
-			# 注意：我们不需要在这里 'touch' 文件。
-			# 'sudo' 配合编辑器（如 nano 或 vi）在保存时会自动创建文件。
-			;;
+		*) ;;
 		esac
 	fi
 
-	# --- 2. 检查并选择编辑器 ---
-	if command -v nano >/dev/null; then
-		# 优先使用 nano
+	# --- 2. 按优先级选择编辑器: $VISUAL → $EDITOR → nano → vi ---
+	# 脚本要求 root 运行，此处无需 sudo。
+	if [[ -n "${VISUAL:-}" ]] && command -v "$VISUAL" >/dev/null 2>&1; then
+		editor_cmd="$VISUAL"
+	elif [[ -n "${EDITOR:-}" ]] && command -v "$EDITOR" >/dev/null 2>&1; then
+		editor_cmd="$EDITOR"
+	elif command -v nano >/dev/null 2>&1; then
 		editor_cmd="nano"
+	elif command -v vi >/dev/null 2>&1; then
+		editor_cmd="vi"
+		echo -e "${TIP} 将使用 vi 编辑器。按 'i' 进入插入模式，'Esc' 退出插入模式，':wq' 保存，':q!' 放弃。"
 	else
-		# nano 不存在，提示安装
-		echo "首选编辑器 'nano' 未安装。"
-		# (Y/n) 格式，n/N 以外的任何输入（包括回车）都将继续
-		read -r -p "您想现在安装 'nano' 吗？ (Y/n): " install_choice
-
-		case "$install_choice" in
-		[nN])
-			# 用户不安装，回退到 vi
-			echo "好的，将使用 'vi' 编辑器。"
-			echo "提示：'vi' 启动后，按 'i' 键进入插入模式，'Esc' 键退出插入模式，"
-			echo "   然后输入 ':wq' 保存并退出，或 ':q!' 不保存退出。"
-			editor_cmd="vi"
-			;;
-		*)
-			# 这是一个安全的设计：函数不应该自己执行安装。
-			# 它应该指导用户，然后退出，让用户安装后重试。
-			echo "请在您的终端中运行:"
-			echo "  sudo apt install nano  (适用于 Debian/Ubuntu)"
-			echo "  sudo dnf install nano  (适用于 Fedora/RHEL 8+)"
-			echo "  sudo yum install nano  (适用于 CentOS 7)"
-			echo "安装完成后，请重新运行此函数。"
-			echo "操作已取消。"
-			return 1 # 1 表示一个非0的退出码，表示未完成
-			;;
-		esac
-	fi
-
-	# --- 3. 执行编辑 ---
-	echo "正在使用 $editor_cmd 打开 $target_file..."
-	echo "请注意：编辑系统文件需要管理员权限，您可能需要输入密码。"
-
-	# 使用 sudo 来运行编辑器，以便有权限写入 /etc/sysctl.d/ 目录
-	if ! "$editor_cmd" "$target_file"; then
-		echo "编辑器 '$editor_cmd' 启动失败或异常退出。"
-		echo "请检查您的 sudo 权限或编辑器是否正确安装。"
+		echo -e "${ERROR} 未找到可用文本编辑器 (nano / vi)，请先安装:"
+		if [[ "${OS_TYPE}" == "CentOS" ]]; then
+			echo -e "  yum install -y nano"
+		else
+			echo -e "  apt-get install -y nano"
+		fi
 		return 1
 	fi
 
-	# --- 4. (修改) 默认直接应用 ---
-	echo ""
-	echo "编辑完成。"
-	echo "正在应用 $target_file 中的设置..."
+	# --- 3. 执行编辑 ---
+	echo -e "${INFO} 使用 [${editor_cmd}] 打开 ${target_file}..."
+	if ! "$editor_cmd" "$target_file"; then
+		echo -e "${ERROR} 编辑器启动失败或异常退出。"
+		return 1
+	fi
 
-	# -p 参数会从指定文件中加载设置
-	sysctl -p "$target_file"
-	echo "已执行应用，部分可能需要重启生效"
+	# --- 4. 应用新配置 ---
+	echo ""
+	echo -e "${INFO} 正在应用新配置..."
+	# sysctl --system 加载 /etc/sysctl.d/ 全部文件，比 sysctl -p 单文件更完整
+	sysctl --system >/dev/null 2>&1
+	echo -e "${INFO} 内核参数已重载。部分参数需重启后才能生效。"
 }
 
 # =================================================
@@ -1505,7 +1976,7 @@ check_sys_official() {
 	if [[ "${OS_TYPE}" == "CentOS" ]]; then
 		[[ "${OS_ARCH}" != "x86_64" ]] && {
 			echo -e "${ERROR} 不支持x86_64以外的系统 !"
-			exit 1
+			return 1
 		}
 		if [[ "${OS_VERSION_ID}" == "7" ]]; then
 			yum install kernel kernel-headers -y --skip-broken
@@ -1513,7 +1984,7 @@ check_sys_official() {
 			# CentOS 8、9、10 都是同样的包结构
 			yum install kernel kernel-core kernel-headers -y --skip-broken
 		else
-			echo -e "${ERROR} 不支持当前系统 CentOS ${OS_VERSION_ID} !" && exit 1
+			echo -e "${ERROR} 不支持当前系统 CentOS ${OS_VERSION_ID} !" && return 1
 		fi
 	elif [[ "${OS_TYPE}" == "Debian" ]]; then
 		apt update
@@ -1538,7 +2009,7 @@ check_sys_official_bbr() {
 	if [[ "${OS_TYPE}" == "CentOS" ]]; then
 		[[ "${OS_ARCH}" != "x86_64" ]] && {
 			echo -e "${ERROR} 不支持x86_64以外的系统 !"
-			exit 1
+			return 1
 		}
 		rpm --import https://www.elrepo.org/RPM-GPG-KEY-elrepo.org
 		if [[ "${OS_VERSION_ID}" == "7" ]]; then
@@ -1554,7 +2025,7 @@ check_sys_official_bbr() {
 			yum install https://www.elrepo.org/elrepo-release-10.el10.elrepo.noarch.rpm -y
 			yum --enablerepo=elrepo-kernel install kernel-ml kernel-ml-headers -y --skip-broken
 		else
-			echo -e "${ERROR} 不支持当前系统 CentOS ${OS_VERSION_ID} !" && exit 1
+			echo -e "${ERROR} 不支持当前系统 CentOS ${OS_VERSION_ID} !" && return 1
 		fi
 	elif [[ "${OS_TYPE}" == "Debian" ]]; then
 		apt update
@@ -1578,7 +2049,7 @@ check_sys_official_bbr() {
 
 				[[ -z "$codename" ]] && {
 					echo -e "${ERROR} 无法获取 Debian 代号"
-					exit 1
+					return 1
 				}
 				echo "deb http://deb.debian.org/debian ${codename}-backports main" >/etc/apt/sources.list.d/${codename}-backports.list
 				apt update
@@ -1603,11 +2074,11 @@ install_xanmod_generic() {
 	local edition="$1" # main, lts, edge, rt
 	[[ "${OS_ARCH}" != "x86_64" ]] && {
 		echo -e "${ERROR} Xanmod 仅支持 x86_64 !"
-		exit 1
+		return 1
 	}
 	[[ "${OS_TYPE}" != "Debian" ]] && {
 		echo -e "${ERROR} 当前一键 Xanmod 仅支持 Debian/Ubuntu !"
-		exit 1
+		return 1
 	}
 
 	apt update
@@ -1623,11 +2094,30 @@ install_xanmod_generic() {
 	wget -qO - https://dl.xanmod.org/gpg.key | gpg --dearmor --yes -o /usr/share/keyrings/xanmod-archive-keyring.gpg
 	echo 'deb [signed-by=/usr/share/keyrings/xanmod-archive-keyring.gpg] http://deb.xanmod.org releases main' | tee /etc/apt/sources.list.d/xanmod-kernel.list
 
-	wget -qO check_x86-64_psabi.sh https://dl.xanmod.org/check_x86-64_psabi.sh
-	chmod +x check_x86-64_psabi.sh
-	local cpu_level=$(./check_x86-64_psabi.sh | awk -F 'v' '{print $2}')
+	# 在临时目录下载并运行 CPU 支持等级检测脚本，避免污染调用方 CWD
+	local xanmod_work
+	xanmod_work=$(mktemp -d /tmp/xanmod_install.XXXXXX) || {
+		echo -e "${ERROR} 无法创建临时目录！"
+		return 1
+	}
+	trap 'cd /tmp; rm -rf "$xanmod_work"; trap - RETURN' RETURN
+	cd "$xanmod_work" || {
+		echo -e "${ERROR} 无法进入临时目录！"
+		return 1
+	}
+
+	local cpu_level="1"
+	if wget -qO check_x86-64_psabi.sh https://dl.xanmod.org/check_x86-64_psabi.sh 2>/dev/null &&
+		[[ -s check_x86-64_psabi.sh ]]; then
+		chmod +x check_x86-64_psabi.sh
+		# 输出示例 "Your CPU supports x86-64-v3"；提取最后出现的 v1-v4 数字
+		cpu_level=$(./check_x86-64_psabi.sh 2>/dev/null |
+			grep -oE '\bv[1-4]\b' | tail -n 1 | tr -d 'v')
+		[[ -z "$cpu_level" ]] && cpu_level="1"
+	else
+		echo -e "${TIP} CPU 等级检测脚本下载失败，将使用 v1 (最兼容) 版本。"
+	fi
 	echo -e "${INFO} CPU 支持等级: \033[32mv${cpu_level}\033[0m"
-	[[ -z "$cpu_level" ]] && cpu_level="1" # 默认 fallback
 
 	apt update
 	local pkg_name="linux-xanmod"
@@ -1635,7 +2125,7 @@ install_xanmod_generic() {
 
 	if [[ "$cpu_level" -ge 3 ]]; then
 		apt install "${pkg_name}-x64v3" -y
-	elif [[ "$cpu_level" == 2 ]]; then
+	elif [[ "$cpu_level" -ge 2 ]]; then
 		apt install "${pkg_name}-x64v2" -y
 	else
 		apt install "${pkg_name}-x64v1" -y
@@ -1654,7 +2144,7 @@ check_sys_official_xanmod_rt() { install_xanmod_generic "rt"; }
 check_sys_official_zen() {
 	[[ "${OS_ARCH}" != "x86_64" ]] && {
 		echo -e "${ERROR} Zen内核仅支持x86_64 !"
-		exit 1
+		return 1
 	}
 	if [[ "${OS_ID}" == "debian" || "${OS_ID}" == "kali" || "${OS_ID_LIKE}" == *"debian"* ]] && [[ "${OS_ID_LIKE}" != *"ubuntu"* && "${OS_ID}" != "ubuntu" && "${OS_ID}" != "pop" ]]; then
 		curl -sL 'https://liquorix.net/add-liquorix-repo.sh' | bash
@@ -1664,7 +2154,7 @@ check_sys_official_zen() {
 		add-apt-repository ppa:damentz/liquorix -y && apt-get update
 		apt-get install linux-image-liquorix-amd64 linux-headers-liquorix-amd64 -y
 	else
-		echo -e "${ERROR} Zen内核当前脚本仅支持 Debian/Ubuntu 及衍生版 !" && exit 1
+		echo -e "${ERROR} Zen内核当前脚本仅支持 Debian/Ubuntu 及衍生版 !" && return 1
 	fi
 	BBR_grub
 	echo -e "${TIP} 内核安装完毕。"
