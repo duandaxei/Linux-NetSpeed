@@ -6,9 +6,17 @@ export PATH
 # =================================================
 #  全局配置区 (Configuration as Data)
 # =================================================
-readonly SH_VER="100.0.6.3"
+readonly SH_VER="100.0.6.6"
 readonly GITHUB_RAW_URL="https://raw.githubusercontent.com/ylx2016/Linux-NetSpeed/master"
 readonly CLOUD_STATE_FILE="/etc/tcpx_cloud_lastver" # installcloud 记忆上次探测到的最高可安装 Cloud 内核
+
+# 自安装：把脚本落地到 /usr/local/bin/tcpx，安装后可直接输入 tcpx 运行。
+# 以 bash <(curl -fsSL <URL>) 这类管道方式运行时本地没有文件副本，只能从下面的地址重新下载。
+# 默认使用与 Update_Shell 相同的权威地址；也可用环境变量 TCPX_URL 临时覆盖：
+#   TCPX_URL=<地址> bash <(curl -fsSL <地址>)
+readonly TCPX_URL_DEFAULT="${GITHUB_RAW_URL}/tcpx.sh"
+readonly TCPX_SELF_URL="${TCPX_URL:-$TCPX_URL_DEFAULT}"
+readonly TCPX_INSTALL_PATH="/usr/local/bin/tcpx"
 
 # 颜色变量定义
 readonly GREEN_FONT_PREFIX="\033[32m"
@@ -247,11 +255,11 @@ check_cn_status() {
 		IS_CN=1
 		echo -e "${INFO} 检测到当前节点位于中国大陆，正在为您测速并选择最快的 GitHub 镜像..."
 
+		# 优先测速：只探测 3 个高质量镜像，选最快者作为首选
 		local mirrors=(
 			"https://gh-proxy.com/"
-			"https://ghfast.top/"
-			"https://hub.gitmirror.com/"
-			"https://gh.ddlc.top/"
+			"https://ghproxy.net/"
+			"https://fastgit.cc/"
 		)
 
 		# 使用极小的 releases 校验文件作为测速目标 (不到 100 字节)，完美适配镜像站的 release 代理规则
@@ -308,11 +316,14 @@ safe_wget() {
 	local timeout=15
 
 	# 定义默认的加速镜像前缀池
+	# 下载兜底池：3 个高质量镜像在前，其余可用镜像随后
 	local mirrors=(
 		"https://gh-proxy.com/"
+		"https://ghproxy.net/"
+		"https://fastgit.cc/"
+		"https://githubdog.com/"
+		"https://tvv.tw/"
 		"https://ghfast.top/"
-		"https://hub.gitmirror.com/"
-		"https://gh.ddlc.top/"
 	)
 
 	# 核心逻辑：根据测速结果重构下载队列
@@ -361,10 +372,9 @@ safe_wget() {
 	return 1
 }
 
-# 3. 稳健的 GitHub 资源获取函数 (使用 jq 提取 JSON)
+# 3. 稳健的 GitHub 资源获取函数 (使用 jq 提取 JSON，再通过 grep 多重过滤)
 # 用法: get_github_asset <仓库名> <Tag关键词> <文件名关键词>
 # 示例: get_github_asset "ylx2016/kernel" "Debian_Kernel" "headers"
-# 3. 稳健的 GitHub 资源获取函数 (提取所有链接后通过 grep 多重过滤)
 get_github_asset() {
 	local repo="$1"
 	local tag_kw="$2"
@@ -615,7 +625,7 @@ installbbrplus() {
 		img_url="https://github.com/cx9208/Linux-NetSpeed/raw/master/bbrplus/debian-ubuntu/x64/linux-image-4.14.129-bbrplus.deb"
 	else
 		echo -e "${ERROR} BBRplus 4.14.129 仅支持 CentOS 7 或 Debian x86_64！"
-		exit 1
+		return 1
 	fi
 
 	install_kernel_generic "BBRplus 4.14.129" "$head_url" "$img_url"
@@ -926,10 +936,40 @@ installlot() {
 	BBR_grub
 }
 
+# 询问本机用途，决定"场景相关"参数(内核转发/合包/conntrack)。其余基座参数三种场景通用。
+# 交互提示走 stderr，仅最终结果(web/proxy/forward)走 stdout，便于 $(...) 捕获。
+# 10 秒无输入或直接回车 → 默认 proxy(机场代理)。
+ask_workload_profile() {
+	local ans
+	echo -e "${INFO} 请选择本机用途 (影响 合包/conntrack 等场景参数；内核转发默认全开):" >&2
+	echo -e "      [1] 网站 / 通用          (Nginx/PHP/DB，主要入站短连接)" >&2
+	echo -e "      [2] 机场代理 / 转发组网  (SS/Xray/Trojan/Hysteria/WireGuard/tun) <-- 默认" >&2
+	read -t 10 -rp "      输入 1/2 (10 秒无输入或回车默认 [2] 代理): " ans
+	echo >&2
+	case "$ans" in
+	1) echo "web" ;;
+	*) echo "proxy" ;;
+	esac
+}
+
 # =================================================
 #  系统级网络与资源自适应优化 (替换旧版优化)
 # =================================================
 optimizing_system() {
+	# 与 tcpfit 共存时让路：tcpfit 会按实测 BDP/内存推导整套 sysctl，并刻意省略
+	# 某些参数 (如 tcp_notsent_lowat)。本函数整文件覆盖会与其重叠、甚至塞回它故意
+	# 不设的项，且因 99-tcpfit.conf 加载在后而多半失效。故先警告并要求显式确认。
+	if tcpfit_present; then
+		echo -e "${TIP} 检测到 tcpfit 正在管理网络 sysctl (/etc/sysctl.d/99-tcpfit.conf)。"
+		echo -e "${TIP} tcpx 的整体优化会与其重叠，重叠键最终以 tcpfit 为准，且可能引入"
+		echo -e "      tcpfit 有意省略的参数。建议改用菜单 [60] 调起 tcpfit 精调。"
+		read -rp "仍要继续执行 tcpx 的系统优化吗？(请输入大写 YES 继续): " _go
+		if [[ "$_go" != "YES" ]]; then
+			echo -e "${INFO} 已跳过，网络精调交由 tcpfit 负责。"
+			return 0
+		fi
+	fi
+
 	echo -e "${INFO} 开始进行系统级网络优化 (自适应 CPU/内存/内核版本)..."
 
 	# 1. 动态获取系统硬件与内核参数
@@ -954,21 +994,41 @@ optimizing_system() {
 		echo -e "${TIP} 检测到当前已禁用 IPv6，本次优化将保持该状态 (如需开启请用菜单 [36])。"
 	fi
 
-	# 2. 根据内存大小动态适配网络缓存与文件描述符
-	local tcp_mem_max somaxconn file_max
+	# 1.5 询问本机用途，决定场景相关参数(合包/conntrack)，其余基座参数通用。
+	#     内核转发按用户要求默认全开，不再随用途区分。
+	local workload autocork tune_conntrack
+	workload=$(ask_workload_profile)
+	case "$workload" in
+	web)
+		autocork=1
+		tune_conntrack=0
+		echo -e "${INFO} 用途=网站/通用：开启合包(autocorking 提升小响应效率)。"
+		;;
+	*)
+		autocork=0
+		tune_conntrack=1
+		echo -e "${INFO} 用途=机场代理/转发：关闭合包(低延迟)、抬高 conntrack 上限。"
+		;;
+	esac
+
+	# 2. 根据内存大小动态适配 (socket 缓冲上限 / 并发连接 / 文件描述符)
+	#    注意: sock_buf_max 只是"每 socket 自动调优的上限"，不是默认值。默认值必须
+	#    保持很小 (见下方 rmem_default/wmem_default)，否则每条连接都按上限预留内存，
+	#    高并发下极易 OOM —— 这是旧版最严重的负优化 (8G 机器默认缓冲写到了 64MB)。
+	local sock_buf_max somaxconn file_max
 	if [ "$total_mem_mb" -ge 8192 ]; then
-		# 8GB 及以上高配机器
-		tcp_mem_max=134217728 # 128MB 缓存
+		# 8GB 及以上高配机器: 每 socket 上限 64MB (足够覆盖高 BDP 链路，且不虚高)
+		sock_buf_max=67108864
 		somaxconn=1048576
 		file_max=2097152
 	elif [ "$total_mem_mb" -ge 2048 ]; then
-		# 2GB - 8GB 中等配置
-		tcp_mem_max=67108864 # 64MB 缓存
+		# 2GB - 8GB 中等配置: 32MB
+		sock_buf_max=33554432
 		somaxconn=65535
 		file_max=1048576
 	else
-		# 2GB 以下小内存机器
-		tcp_mem_max=16777216 # 16MB 缓存
+		# 2GB 以下小内存机器: 16MB
+		sock_buf_max=16777216
 		somaxconn=32768
 		file_max=524288
 	fi
@@ -994,54 +1054,59 @@ optimizing_system() {
 fs.file-max = $file_max
 fs.inotify.max_user_instances = 8192
 fs.inotify.max_user_watches = $file_max
-kernel.pid_max = 65535
+# 现代 64 位内核默认 pid_max 已是 4194304，旧版写死 65535 反而是"降级"，
+# 高进程/线程数场景 (大量容器、Go/Java 服务) 会 fork 失败。取现代默认值。
+kernel.pid_max = 4194304
 vm.swappiness = 1
-vm.overcommit_memory = 1
 
 # --- 网络核心队列与连接数 ---
 net.core.somaxconn = $somaxconn
 net.core.netdev_max_backlog = $netdev_max_backlog
 net.core.netdev_budget = $netdev_budget
-net.core.rmem_max = $tcp_mem_max
-net.core.wmem_max = $tcp_mem_max
-net.core.rmem_default = $((tcp_mem_max / 2))
-net.core.wmem_default = $((tcp_mem_max / 2))
+net.core.rmem_max = $sock_buf_max
+net.core.wmem_max = $sock_buf_max
+# 默认收发缓冲保持较小，由内核在 min~max 间自动放大即可；
+# 切勿设成上限的一半 (旧版在 8G 机上把默认写到 64MB，空闲连接也吃满，属严重负优化)。
+net.core.rmem_default = 262144
+net.core.wmem_default = 262144
 net.core.optmem_max = 65536
 
 # --- TCP 核心调优 (缓冲区自适应) ---
-net.ipv4.tcp_rmem = 4096 87380 $tcp_mem_max
-net.ipv4.tcp_wmem = 4096 65536 $tcp_mem_max
+net.ipv4.tcp_rmem = 4096 131072 $sock_buf_max
+net.ipv4.tcp_wmem = 4096 65536 $sock_buf_max
 net.ipv4.udp_rmem_min = 8192
 net.ipv4.udp_wmem_min = 8192
 net.ipv4.tcp_mtu_probing = 1
-net.ipv4.tcp_autocorking = 0
+net.ipv4.tcp_autocorking = $autocork
 net.ipv4.tcp_slow_start_after_idle = 0
 net.ipv4.tcp_max_syn_backlog = $somaxconn
-net.ipv4.tcp_notsent_lowat = 16384
-net.ipv4.tcp_no_metrics_save = 0
+# tcp_no_metrics_save=1: 不缓存上条连接的 RTT/cwnd 指标，避免一次抖动的坏指标
+# 拖累后续新连接的初始拥塞窗口 (旧版设为 0 会保存陈旧指标，属负优化)。
+net.ipv4.tcp_no_metrics_save = 1
 net.ipv4.tcp_ecn = 1
 net.ipv4.tcp_ecn_fallback = 1
-net.ipv4.tcp_frto = 0
 
 # --- TCP 超时、重传与 KeepAlive 优化 ---
 net.ipv4.tcp_keepalive_time = 600
 net.ipv4.tcp_keepalive_intvl = 15
 net.ipv4.tcp_keepalive_probes = 2
 net.ipv4.tcp_fin_timeout = 15
-net.ipv4.tcp_synack_retries = 1
+# synack_retries 旧版=1：弱网/丢包客户端收不到 SYN-ACK 就直接连不上(网站可达性、
+# 代理手机端连接失败)。取 2，在抗 SYN 洪水与可用性之间折中。
+net.ipv4.tcp_synack_retries = 2
 net.ipv4.tcp_orphan_retries = 1
-net.ipv4.tcp_retries2 = 5
 net.ipv4.tcp_syncookies = 1
 net.ipv4.tcp_rfc1337 = 0
 net.ipv4.tcp_timestamps = 1
 net.ipv4.tcp_tw_reuse = 1
 net.ipv4.ip_local_port_range = 1024 65535
-net.ipv4.tcp_max_tw_buckets = 5000
+# tw_buckets 旧版 5000 过低：繁忙代理/服务器一旦超过就强杀 TIME_WAIT，
+# 引发端口复用异常与 RST。配合 tcp_tw_reuse=1，取一个更从容的值。
+net.ipv4.tcp_max_tw_buckets = 55000
 net.ipv4.tcp_fastopen = 3
 
-# --- 路由转发与 IPv6 (默认开启转发以兼容 Docker/Tailscale 等) ---
+# --- 路由转发 (默认全开，兼容 Docker/Tailscale/WireGuard 等；route_localnet 已按安全建议移除) ---
 net.ipv4.ip_forward = 1
-net.ipv4.conf.all.route_localnet = 1
 net.ipv4.conf.all.forwarding = 1
 net.ipv4.conf.default.forwarding = 1
 net.ipv6.conf.all.forwarding = 1
@@ -1054,6 +1119,16 @@ net.ipv6.conf.default.disable_ipv6 = $current_disable_ipv6
 net.core.default_qdisc = $current_qdisc
 net.ipv4.tcp_congestion_control = $current_cc
 EOF
+
+	# 4.1 场景相关：繁忙中转/转发节点抬高连接跟踪表上限，避免 conntrack 打满丢连接。
+	#     nf_conntrack 模块未加载时该键不存在，sysctl 载入会忽略(告警已抑制)，故无害。
+	if [[ "$tune_conntrack" -eq 1 ]]; then
+		cat >>"$sysctl_conf" <<EOF
+
+# --- 连接跟踪 (用途=代理/转发，繁忙节点防 conntrack 表溢出) ---
+net.netfilter.nf_conntrack_max = 262144
+EOF
+	fi
 
 	# 5. 根据内核版本进行高级参数兼容
 	# 移除低版本废弃参数: net.ipv4.tcp_tw_recycle (在内核 4.12 中已彻底移除，高版本强制写入会报错)
@@ -1071,10 +1146,15 @@ EOF
 
 	# 优化 Systemd 配置
 	if [[ -d "/etc/systemd" ]]; then
+		# 整文件覆盖前先备份用户原有配置。仅在 .bak 不存在时备份，
+		# 避免重复运行本函数时用"已被我们改写过的版本"覆盖掉最初的原始文件。
+		[[ -f /etc/systemd/system.conf && ! -f /etc/systemd/system.conf.bak ]] &&
+			cp /etc/systemd/system.conf /etc/systemd/system.conf.bak
 		cat >/etc/systemd/system.conf <<EOF
 [Manager]
 DefaultTimeoutStopSec=30s
-DefaultLimitCORE=infinity
+# core dump 关闭：崩溃 core 可能含 TLS 私钥/代理凭据且会撑爆磁盘，故禁用。
+DefaultLimitCORE=0
 DefaultLimitNOFILE=$file_max
 DefaultLimitNPROC=infinity
 DefaultTasksMax=infinity
@@ -1082,20 +1162,22 @@ EOF
 		systemctl daemon-reload >/dev/null 2>&1
 	fi
 
-	# 优化 limits.conf
+	# 优化 limits.conf (同样先备份原始文件，仅首次备份)
+	[[ -f /etc/security/limits.conf && ! -f /etc/security/limits.conf.bak ]] &&
+		cp /etc/security/limits.conf /etc/security/limits.conf.bak
 	cat >/etc/security/limits.conf <<EOF
 * soft   nofile    $file_max
 * hard   nofile    $file_max
 * soft   nproc     unlimited
 * hard   nproc     unlimited
-* soft   core      unlimited
-* hard   core      unlimited
+* soft   core      0
+* hard   core      0
 root  soft   nofile    $file_max
 root  hard   nofile    $file_max
 root  soft   nproc     unlimited
 root  hard   nproc     unlimited
-root  soft   core      unlimited
-root  hard   core      unlimited
+root  soft   core      0
+root  hard   core      0
 EOF
 
 	# 清理旧的 ulimit 注入
@@ -1114,9 +1196,11 @@ EOF
 	# 前面单独的 sysctl -p "$sysctl_conf" 属于重复执行，已移除。
 	sysctl --system >/dev/null 2>&1
 
-	# 启用透明大页加速 (如果支持)
+	# 透明大页设为 madvise: 仅对显式 madvise(MADV_HUGEPAGE) 的程序启用大页。
+	# 相比 always，可避免 Redis/数据库等延迟敏感服务因大页整理(khugepaged)
+	# 产生的卡顿与内存放大；同时不影响真正需要大页的程序主动申请。
 	if [[ -f /sys/kernel/mm/transparent_hugepage/enabled ]]; then
-		echo always >/sys/kernel/mm/transparent_hugepage/enabled
+		echo madvise >/sys/kernel/mm/transparent_hugepage/enabled 2>/dev/null
 	fi
 
 	echo -e "${INFO} 系统网络与资源限制自适应优化完成！(建议完成后重启服务器以全面生效)"
@@ -1126,12 +1210,60 @@ EOF
 #  网络加速统一切换引擎 (替代原来十几个 startxxx 函数)
 # =================================================
 
+# 检测本机是否由 tcpfit (独立网络精调工具) 管理。
+# tcpfit 把自己的 sysctl 写在 /etc/sysctl.d/99-tcpfit.conf，并安装 tc 出向整形
+# (tcpfit-qdisc.service) 与状态目录 /var/lib/tcpfit。任一特征存在即认为其在管理本机。
+tcpfit_present() {
+	[[ -f /etc/sysctl.d/99-tcpfit.conf ]] && return 0
+	[[ -x /usr/local/bin/tcpfit ]] && return 0
+	[[ -d /var/lib/tcpfit ]] && return 0
+	systemctl list-unit-files 2>/dev/null | grep -q '^tcpfit-qdisc\.service' && return 0
+	return 1
+}
+
+# 返回 cc/qdisc/ecn 应写入的 sysctl 文件。
+# sysctl --system 按文件名字典序加载，后者覆盖前者：99-sysctl.conf < 99-tcpfit.conf，
+# 故 tcpfit 存在时若仍写 99-sysctl.conf，用户在菜单里选的算法会被 tcpfit 的 bbr 覆盖。
+# 改写到 99-zz-tcpx-accel.conf (排序在 99-tcpfit.conf 之后)，让用户的显式选择生效。
+readonly TCPX_ACCEL_DROPIN="/etc/sysctl.d/99-zz-tcpx-accel.conf"
+accel_conf_path() {
+	if tcpfit_present; then
+		echo "$TCPX_ACCEL_DROPIN"
+	else
+		echo "/etc/sysctl.d/99-sysctl.conf"
+	fi
+}
+
+# tcpfit 的出向整形是否正在运行。它对网卡出向限速/整形，会盖过任何拥塞算法
+# (LotSpeed / BBR / 锐速) 的实际吞吐——换算法不会自动解除它。
+tcpfit_shaper_active() {
+	systemctl is-active tcpfit-qdisc.service >/dev/null 2>&1
+}
+
+# 开启加速前，若检测到 tcpfit 整形在跑，询问用户是否停用，避免"换了算法却跑不满"。
+maybe_offer_disable_tcpfit_shaper() {
+	tcpfit_shaper_active || return 0
+	echo -e "${TIP} 检测到 tcpfit 出向整形 (tcpfit-qdisc.service) 正在运行。"
+	echo -e "${TIP} 它会对网卡出向限速/整形，从而限制本次加速算法的实际吞吐。"
+	read -rp "是否停用 tcpfit 整形以便加速全速生效？(y=停用 / 回车=保留): " _shaper_ans
+	if [[ "$_shaper_ans" =~ ^[yY]$ ]]; then
+		systemctl disable --now tcpfit-qdisc.service >/dev/null 2>&1
+		echo -e "${INFO} 已停用 tcpfit 出向整形 (恢复: systemctl enable --now tcpfit-qdisc.service，或重新运行 tcpfit)。"
+	else
+		echo -e "${INFO} 已保留 tcpfit 整形，加速算法吞吐仍会受其限制。"
+	fi
+}
+
 # 卸载加速器 (清理配置)
 remove_bbr_lotserver() {
 	echo -e "${INFO} 正在清理旧的拥塞控制与队列算法配置..."
-	local sysctl_conf="/etc/sysctl.d/99-sysctl.conf"
-	[[ -f "$sysctl_conf" ]] && sed -i '/net.core.default_qdisc/d; /net.ipv4.tcp_congestion_control/d; /net.ipv4.tcp_ecn/d' "$sysctl_conf"
-	[[ -f "/etc/sysctl.conf" ]] && sed -i '/net.core.default_qdisc/d; /net.ipv4.tcp_congestion_control/d; /net.ipv4.tcp_ecn/d' /etc/sysctl.conf
+	# 三处都清: 主文件、传统 /etc/sysctl.conf、以及 tcpfit 共存时用的高优先级 drop-in，
+	# 避免切换算法后残留旧行 (drop-in 排序最靠后，残留会覆盖新选择)。
+	local f
+	for f in /etc/sysctl.d/99-sysctl.conf /etc/sysctl.conf "$TCPX_ACCEL_DROPIN"; do
+		# tcp_ecn 用 [[:space:]]*= 收尾锚定，避免顺带删掉 net.ipv4.tcp_ecn_fallback
+		[[ -f "$f" ]] && sed -i '/net.core.default_qdisc/d; /net.ipv4.tcp_congestion_control/d; /net\.ipv4\.tcp_ecn[[:space:]]*=/d' "$f"
+	done
 
 	sysctl --system >/dev/null 2>&1
 
@@ -1161,12 +1293,26 @@ enable_acceleration() {
 	local qdisc="$1"
 	local cc="$2"
 
+	# remove_bbr_lotserver 会连同 tcp_ecn 行一并删除。先记住当前 ECN 状态，
+	# 切换算法后按原样写回，避免用户在菜单 [30] 开启的 ECN 被静默清掉。
+	local prev_ecn
+	prev_ecn=$(cat /proc/sys/net/ipv4/tcp_ecn 2>/dev/null)
+	[[ ! "$prev_ecn" =~ ^[0-2]$ ]] && prev_ecn=""
+
 	remove_bbr_lotserver
+	maybe_offer_disable_tcpfit_shaper
 
 	echo -e "${INFO} 正在应用: ${cc} + ${qdisc} ..."
-	local sysctl_conf="/etc/sysctl.d/99-sysctl.conf"
+	local sysctl_conf
+	sysctl_conf=$(accel_conf_path)
+	if [[ "$sysctl_conf" == "$TCPX_ACCEL_DROPIN" ]]; then
+		echo -e "${TIP} 检测到 tcpfit，已将本次选择写入高优先级文件 ${sysctl_conf}"
+		echo -e "${TIP} 以覆盖 tcpfit 默认的 bbr/fq (仅覆盖 cc/qdisc，其余精调仍归 tcpfit)。"
+	fi
 	echo "net.core.default_qdisc=$qdisc" >>"$sysctl_conf"
 	echo "net.ipv4.tcp_congestion_control=$cc" >>"$sysctl_conf"
+	# 保留切换前的 ECN 设置
+	[[ -n "$prev_ecn" ]] && echo "net.ipv4.tcp_ecn=$prev_ecn" >>"$sysctl_conf"
 
 	sysctl --system >/dev/null 2>&1
 	echo -e "${INFO} 加速算法修改成功！如果未立即生效，请重启服务器。"
@@ -1175,6 +1321,7 @@ enable_acceleration() {
 # 启用 Lotserver
 startlotserver() {
 	remove_bbr_lotserver
+	maybe_offer_disable_tcpfit_shaper
 	if [[ "${OS_TYPE}" == "CentOS" ]]; then
 		yum install ethtool -y
 	else
@@ -1203,8 +1350,11 @@ startlotserver() {
 # 开启/关闭 ECN (显式控制)
 set_ecn() {
 	local status="$1"
-	local sysctl_conf="/etc/sysctl.d/99-sysctl.conf"
-	sed -i '/net.ipv4.tcp_ecn/d' "$sysctl_conf" /etc/sysctl.conf 2>/dev/null
+	local sysctl_conf
+	sysctl_conf=$(accel_conf_path)
+	# 从所有可能位置清掉旧 ecn 行，再写入到当前生效优先级最高的文件
+	# 收尾锚定 [[:space:]]*=，只删 tcp_ecn 本身，不误伤 tcp_ecn_fallback
+	sed -i '/net\.ipv4\.tcp_ecn[[:space:]]*=/d' /etc/sysctl.d/99-sysctl.conf /etc/sysctl.conf "$TCPX_ACCEL_DROPIN" 2>/dev/null
 	echo "net.ipv4.tcp_ecn=$status" >>"$sysctl_conf"
 	sysctl --system >/dev/null 2>&1
 	[[ "$status" == "1" ]] && echo -e "${INFO} ECN 已开启！" || echo -e "${INFO} ECN 已关闭！"
@@ -1214,19 +1364,27 @@ set_ecn() {
 remove_all() {
 	echo -e "${INFO} 正在清空网络优化与系统限制..."
 	rm -f /etc/sysctl.d/99-sysctl.conf
+	rm -f "$TCPX_ACCEL_DROPIN"
 	cat /dev/null >/etc/sysctl.conf
 	sysctl --system >/dev/null 2>&1
 
-	sed -i '/DefaultTimeoutStopSec/d; /DefaultLimitCORE/d; /DefaultLimitNOFILE/d; /DefaultLimitNPROC/d' /etc/systemd/system.conf
-	sed -i '/soft   nofile/d; /hard   nofile/d; /soft   nproc/d; /hard   nproc/d; /soft   core/d; /hard   core/d' /etc/security/limits.conf
-	sed -i '/ulimit -SHn/d' /etc/profile
-	sed -i '/required pam_limits.so/d' /etc/pam.d/common-session
+	# 逐个文件加存在性守卫：如 /etc/pam.d/common-session 在 CentOS 上并不存在，
+	# 无守卫的 sed -i 会打印 "No such file" 噪声错误。
+	[[ -f /etc/systemd/system.conf ]] && sed -i '/DefaultTimeoutStopSec/d; /DefaultLimitCORE/d; /DefaultLimitNOFILE/d; /DefaultLimitNPROC/d' /etc/systemd/system.conf
+	[[ -f /etc/security/limits.conf ]] && sed -i '/soft   nofile/d; /hard   nofile/d; /soft   nproc/d; /hard   nproc/d; /soft   core/d; /hard   core/d' /etc/security/limits.conf
+	[[ -f /etc/profile ]] && sed -i '/ulimit -SHn/d' /etc/profile
+	[[ -f /etc/pam.d/common-session ]] && sed -i '/required pam_limits.so/d' /etc/pam.d/common-session
 
 	systemctl daemon-reload
 	remove_bbr_lotserver
 	# 新增：彻底卸载时，物理清理 LotSpeed 残留文件
 	rm -f /usr/local/bin/lotspeed
 	rm -rf /opt/lotspeed
+	# tcpfit 是独立工具，其 sysctl/整形/systemd 单元不归本脚本管理，须单独回滚
+	if tcpfit_present; then
+		echo -e "${TIP} 检测到 tcpfit 仍在管理本机网络参数 (99-tcpfit.conf / tcpfit-qdisc.service 等)。"
+		echo -e "${TIP} tcpx 不会替它卸载，如需彻底还原请另外执行: tcpfit rollback"
+	fi
 	echo -e "${INFO} 系统已恢复原生状态。"
 }
 
@@ -1382,7 +1540,9 @@ delete_kernel_custom() {
 			[[ ! "$pkg" =~ ^kernel(-ml|-lt|-uek|-rt|-plus)?-[0-9] ]] && continue
 		fi
 		# 该镜像不在待删除列表中 → 会被保留
-		[[ " $pkgs_to_del " != *" $pkg "* ]] && ((remaining_images++))
+		# 用赋值式自增而非 ((remaining_images++))：后者在结果为 0 时返回退出码 1，
+		# 将来若启用 set -e 会在此静默中断循环。
+		[[ " $pkgs_to_del " != *" $pkg "* ]] && remaining_images=$((remaining_images + 1))
 	done
 	if [[ $remaining_images -eq 0 ]]; then
 		echo -e "${ERROR} 操作已阻止！删除所选包后系统将无任何可引导内核，重启即变砖！"
@@ -1431,7 +1591,17 @@ startbrutal() {
 	check_status
 	if [[ "$headers_status" == "已匹配" ]]; then
 		echo -e "${INFO} Headers 已匹配，开始编译 Brutal..."
-		bash <(curl -fsSL https://tcp.hy2.sh/)
+		# 统一走 fetch_remote_script: 落盘 + 校验 (非空 & 是 shell 脚本) 后再执行，
+		# 避免 curl | bash 把 404/劫持页直接喂给 bash 以 root 运行。
+		local tmp_brutal
+		tmp_brutal=$(mktemp /tmp/brutal.XXXXXX) || return 1
+		if ! fetch_remote_script "https://tcp.hy2.sh/" "$tmp_brutal"; then
+			rm -f "$tmp_brutal"
+			echo -e "${ERROR} Brutal 安装脚本下载失败！"
+			return 1
+		fi
+		bash "$tmp_brutal"
+		rm -f "$tmp_brutal"
 		if lsmod | grep -q "brutal"; then
 			echo -e "${INFO} Brutal 模块已成功加载！"
 		else
@@ -1459,12 +1629,14 @@ install_lotspeed() {
 
 	if lsmod | grep -q "lotspeed"; then
 		echo -e "${INFO} LotSpeed 模块已成功加载！"
-		# 将其写入 99-sysctl.conf 确保重启后也是默认算法
-		local sysctl_conf="/etc/sysctl.d/99-sysctl.conf"
-		sed -i '/net.ipv4.tcp_congestion_control/d' "$sysctl_conf" /etc/sysctl.conf 2>/dev/null
+		# 将其写入生效优先级最高的文件确保重启后也是默认算法
+		local sysctl_conf
+		sysctl_conf=$(accel_conf_path)
+		sed -i '/net.ipv4.tcp_congestion_control/d' /etc/sysctl.d/99-sysctl.conf /etc/sysctl.conf "$TCPX_ACCEL_DROPIN" 2>/dev/null
 		echo "net.ipv4.tcp_congestion_control=lotspeed" >>"$sysctl_conf"
 		sysctl --system >/dev/null 2>&1
 		echo -e "${INFO} LotSpeed 已设置为默认拥塞控制算法！"
+		maybe_offer_disable_tcpfit_shaper
 	else
 		echo -e "${ERROR} LotSpeed 模块加载失败，请检查上方编译日志（通常是因为内核 Headers 缺失或版本过低）。"
 	fi
@@ -1478,12 +1650,14 @@ enable_lotspeed_standalone() {
 		return
 	fi
 	remove_bbr_lotserver
+	maybe_offer_disable_tcpfit_shaper
 	echo -e "${INFO} 正在启动 LotSpeed 加速..."
 	lotspeed start >/dev/null 2>&1
 
 	# 确保将其写死为默认启动项
-	local sysctl_conf="/etc/sysctl.d/99-sysctl.conf"
-	sed -i '/net.ipv4.tcp_congestion_control/d; /net.core.default_qdisc/d' "$sysctl_conf" /etc/sysctl.conf 2>/dev/null
+	local sysctl_conf
+	sysctl_conf=$(accel_conf_path)
+	sed -i '/net.ipv4.tcp_congestion_control/d; /net.core.default_qdisc/d' /etc/sysctl.d/99-sysctl.conf /etc/sysctl.conf "$TCPX_ACCEL_DROPIN" 2>/dev/null
 	echo "net.core.default_qdisc=fq" >>"$sysctl_conf"
 	echo "net.ipv4.tcp_congestion_control=lotspeed" >>"$sysctl_conf"
 	sysctl --system >/dev/null 2>&1
@@ -1511,6 +1685,50 @@ fetch_remote_script() {
 	if ! head -n 1 "$dest" | grep -qE '^#!.*(bash|sh)'; then
 		echo -e "${ERROR} 下载到的内容不是有效的 Shell 脚本 (可能是错误页或被劫持)！"
 		return 1
+	fi
+	return 0
+}
+
+# 首次运行自安装：把脚本落地到 /usr/local/bin/tcpx，之后可直接输入 tcpx 运行。
+# 兼容两种运行方式：
+#   1) 本地文件   (bash tcpx.sh / ./tcpx.sh)        -> 直接复制自身
+#   2) 管道/进程替换 (bash <(curl -fsSL <URL>))      -> 本地无副本，需从 TCPX_SELF_URL 重新下载
+install_self() {
+	local target="$TCPX_INSTALL_PATH"
+	local src
+	src=$(readlink -f "${BASH_SOURCE[0]:-$0}" 2>/dev/null || echo "${BASH_SOURCE[0]:-$0}")
+
+	# 正在运行的就是安装后的副本，无需再装
+	[[ "$src" == "$target" ]] && return 0
+
+	# 目标目录不可写(极少数只读环境)则跳过，不阻断正常使用
+	[[ -w "$(dirname "$target")" ]] || return 0
+
+	if [[ -f "$src" && -r "$src" ]]; then
+		# 本地文件方式：内容有变化才复制，避免每次运行都写盘
+		if [[ ! -f "$target" ]] || ! cmp -s "$src" "$target"; then
+			if cp "$src" "$target" 2>/dev/null && chmod +x "$target" 2>/dev/null; then
+				echo -e "${INFO} 已安装/更新到 ${target}，之后可直接输入 ${GREEN_FONT_PREFIX}tcpx${FONT_COLOR_SUFFIX} 运行。"
+			fi
+		fi
+		return 0
+	fi
+
+	# 管道/进程替换方式：本地没有文件副本，必须从权威地址重新下载
+	if [[ -n "$TCPX_SELF_URL" ]]; then
+		local tmp
+		tmp=$(mktemp /tmp/tcpx_self.XXXXXX) || return 0
+		if fetch_remote_script "$TCPX_SELF_URL" "$tmp" >/dev/null 2>&1; then
+			if mv -f "$tmp" "$target" 2>/dev/null && chmod +x "$target" 2>/dev/null; then
+				echo -e "${INFO} 已安装到 ${target}，之后可直接输入 ${GREEN_FONT_PREFIX}tcpx${FONT_COLOR_SUFFIX} 运行。"
+			fi
+		else
+			rm -f "$tmp"
+			echo -e "${TIP} 自安装下载失败(地址不可达或非脚本内容)，本次仍可正常使用菜单。"
+		fi
+	else
+		echo -e "${TIP} 检测到以管道方式运行，但未配置下载地址，无法自安装到 ${target}。"
+		echo -e "${TIP} 可用 ${GREEN_FONT_PREFIX}TCPX_URL=<地址> bash <(curl -fsSL <地址>)${FONT_COLOR_SUFFIX} 重新运行以启用自安装。"
 	fi
 	return 0
 }
@@ -1558,8 +1776,19 @@ Update_Shell() {
 	}
 	chmod +x "$self_path"
 
+	# 同步安装/刷新到 /usr/local/bin/tcpx，保证升级后可直接输入 tcpx 运行，
+	# 不再依赖"旧版本升级后是否会重新执行并触发 install_self"这一不确定链路。
+	local reload_path="$self_path"
+	if [[ "$self_path" != "$TCPX_INSTALL_PATH" && -w "$(dirname "$TCPX_INSTALL_PATH")" ]]; then
+		if cp -f "$self_path" "$TCPX_INSTALL_PATH" 2>/dev/null && chmod +x "$TCPX_INSTALL_PATH" 2>/dev/null; then
+			echo -e "${INFO} 已同步安装到 ${GREEN_FONT_PREFIX}${TCPX_INSTALL_PATH}${FONT_COLOR_SUFFIX}，之后可直接输入 ${GREEN_FONT_PREFIX}tcpx${FONT_COLOR_SUFFIX} 运行。"
+			# 从安装后的规范路径重载，后续升级即针对 /usr/local/bin/tcpx 生效
+			reload_path="$TCPX_INSTALL_PATH"
+		fi
+	fi
+
 	echo -e "${INFO} 更新完成，正在重新载入脚本..."
-	exec bash "$self_path"
+	exec bash "$reload_path"
 }
 
 gotodd() {
@@ -1574,11 +1803,6 @@ gotodd() {
 	fi
 	bash "$tmp_sh"
 	rm -f "$tmp_sh"
-}
-
-gotoipcheck() {
-	echo -e "${INFO} 正在下载并运行流媒体/IP检测脚本..."
-	bash <(curl -L -s check.unlock.media)
 }
 
 closeipv6() {
@@ -1610,6 +1834,28 @@ net.ipv4.tcp_synack_retries = 1
 EOF
 	sysctl --system >/dev/null 2>&1
 	echo -e "${INFO} 防 CC 基础参数已写入并生效！"
+}
+
+# 调起 tcpfit 进行网络精调 (自适应 BDP/内存的独立工具)
+# 说明: tcpfit 是独立项目，tcpx 不内置其脚本，也不硬编码不可信的远程下载地址。
+#       优先调用已安装的 tcpfit；否则回退到脚本同目录的 tcpfit.sh；都没有则提示。
+run_tcpfit_tune() {
+	if command -v tcpfit >/dev/null 2>&1; then
+		echo -e "${INFO} 检测到已安装 tcpfit，正在调起..."
+		tcpfit
+		return $?
+	fi
+	local self_dir
+	self_dir=$(dirname "$(readlink -f "$0" 2>/dev/null || echo "$0")")
+	if [[ -f "$self_dir/tcpfit.sh" ]]; then
+		echo -e "${INFO} 检测到同目录 tcpfit.sh，正在运行..."
+		bash "$self_dir/tcpfit.sh"
+		return $?
+	fi
+	echo -e "${ERROR} 未检测到 tcpfit。"
+	echo -e "${TIP} tcpfit 为独立项目，请先自行安装 (安装后本机会出现 /usr/local/bin/tcpfit)。"
+	echo -e "${TIP} 安装后 tcpx 会自动识别，并在切换加速算法/系统优化时避免与其冲突。"
+	return 1
 }
 
 # =================================================
@@ -1660,7 +1906,7 @@ show_menu_panel() {
  ${GREEN_FONT_PREFIX}51.${FONT_COLOR_SUFFIX} 查看排序内核            ${GREEN_FONT_PREFIX}52.${FONT_COLOR_SUFFIX} 删除保留指定内核
  ${GREEN_FONT_PREFIX}55.${FONT_COLOR_SUFFIX} 卸载全部加速            ${GREEN_FONT_PREFIX}99.${FONT_COLOR_SUFFIX} 退出脚本
  ———————————————————————————— 其它工具 —————————————————————————————
- ${GREEN_FONT_PREFIX}60.${FONT_COLOR_SUFFIX} 流媒体/IP解锁检测       ${GREEN_FONT_PREFIX}92.${FONT_COLOR_SUFFIX} 一键DD重装系统
+ ${GREEN_FONT_PREFIX}60.${FONT_COLOR_SUFFIX} 网络精调(tcpfit联动)    ${GREEN_FONT_PREFIX}92.${FONT_COLOR_SUFFIX} 一键DD重装系统
 ————————————————————————————————————————————————————————————————"
 	check_status
 	get_system_info
@@ -1671,6 +1917,9 @@ show_menu_panel() {
 		echo -e " 状态: ${GREEN_FONT_PREFIX}已安装${FONT_COLOR_SUFFIX} ${RED_FONT_PREFIX}${kernel_status}${FONT_COLOR_SUFFIX} 加速内核 , ${GREEN_FONT_PREFIX}${run_status}${FONT_COLOR_SUFFIX} ${RED_FONT_PREFIX}${brutal}${FONT_COLOR_SUFFIX} ${RED_FONT_PREFIX}${lotspeed_status}${FONT_COLOR_SUFFIX}"
 	fi
 	echo -e " 拥塞控制算法: ${GREEN_FONT_PREFIX}${net_congestion_control}${FONT_COLOR_SUFFIX} 队列算法: ${GREEN_FONT_PREFIX}${net_qdisc}${FONT_COLOR_SUFFIX} Headers状态：${GREEN_FONT_PREFIX}${headers_status}${FONT_COLOR_SUFFIX}"
+	if tcpfit_present; then
+		echo -e " ${YELLOW_FONT_PREFIX}检测到 tcpfit 正在管理网络参数${FONT_COLOR_SUFFIX}: 菜单 [60] 可调起 tcpfit，[32] 会让路，切算法自动抢优先级"
+	fi
 }
 
 # 开始菜单 (改为循环驱动)
@@ -1722,7 +1971,7 @@ start_menu() {
 		51) show_kernels ;;
 		52) delete_kernel_custom ;;
 		55) remove_all ;;
-		60) gotoipcheck ;;
+		60) run_tcpfit_tune ;;
 		92) gotodd ;;
 		99)
 			echo -e "${INFO} 已退出。"
@@ -1875,7 +2124,9 @@ update_sysctl_interactive() {
 
 	# 7. 应用配置并进行错误处理
 	log_info "正在应用新的 sysctl 设置..."
-	if apply_output=$(sysctl -p "$CONF_FILE" 2>&1); then
+	# 与脚本其余部分统一使用 sysctl --system，按 /etc/sysctl.d/ 的优先级顺序
+	# 加载全部配置文件，得到与重启后一致的最终合并结果。
+	if apply_output=$(sysctl --system 2>&1); then
 		log_info "Sysctl 设置已成功应用。"
 		echo "--- 应用输出 ---"
 		echo "$apply_output"
@@ -1899,7 +2150,7 @@ update_sysctl_interactive() {
 
 			mv "$BACKUP_FILE" "$CONF_FILE"
 			log_info "正在恢复到之前的设置..."
-			sysctl -p "$CONF_FILE" >/dev/null 2>&1
+			sysctl --system >/dev/null 2>&1
 
 			log_error "回滚完成。配置文件已恢复，问题备份文件保留在 $BACKUP_FILE"
 			return 1
@@ -1963,16 +2214,12 @@ edit_sysctl_interactive() {
 }
 
 # =================================================
-#  官方源内核安装模块 (修复自适应变量)
-# =================================================
-
-# =================================================
 #  官方源内核安装模块 (包含 CentOS 10 战未来支持)
 # =================================================
 
 #检查官方稳定内核并安装
-#检查官方稳定内核并安装
 check_sys_official() {
+	pre_install_check || return 1
 	if [[ "${OS_TYPE}" == "CentOS" ]]; then
 		[[ "${OS_ARCH}" != "x86_64" ]] && {
 			echo -e "${ERROR} 不支持x86_64以外的系统 !"
@@ -2006,6 +2253,7 @@ check_sys_official() {
 
 #检查官方最新内核并安装 (ELRepo / Backports / HWE)
 check_sys_official_bbr() {
+	pre_install_check || return 1
 	if [[ "${OS_TYPE}" == "CentOS" ]]; then
 		[[ "${OS_ARCH}" != "x86_64" ]] && {
 			echo -e "${ERROR} 不支持x86_64以外的系统 !"
@@ -2072,6 +2320,7 @@ check_sys_official_bbr() {
 # 统一 Xanmod 安装引擎
 install_xanmod_generic() {
 	local edition="$1" # main, lts, edge, rt
+	pre_install_check || return 1
 	[[ "${OS_ARCH}" != "x86_64" ]] && {
 		echo -e "${ERROR} Xanmod 仅支持 x86_64 !"
 		return 1
@@ -2142,12 +2391,22 @@ check_sys_official_xanmod_rt() { install_xanmod_generic "rt"; }
 
 #检查Zen官方内核并安装
 check_sys_official_zen() {
+	pre_install_check || return 1
 	[[ "${OS_ARCH}" != "x86_64" ]] && {
 		echo -e "${ERROR} Zen内核仅支持x86_64 !"
 		return 1
 	}
 	if [[ "${OS_ID}" == "debian" || "${OS_ID}" == "kali" || "${OS_ID_LIKE}" == *"debian"* ]] && [[ "${OS_ID_LIKE}" != *"ubuntu"* && "${OS_ID}" != "ubuntu" && "${OS_ID}" != "pop" ]]; then
-		curl -sL 'https://liquorix.net/add-liquorix-repo.sh' | bash
+		# 落盘校验后再执行 Liquorix 加源脚本，避免 curl | bash
+		local tmp_lqx
+		tmp_lqx=$(mktemp /tmp/liquorix.XXXXXX) || return 1
+		if ! fetch_remote_script "https://liquorix.net/add-liquorix-repo.sh" "$tmp_lqx"; then
+			rm -f "$tmp_lqx"
+			echo -e "${ERROR} Liquorix 源脚本下载失败！"
+			return 1
+		fi
+		bash "$tmp_lqx"
+		rm -f "$tmp_lqx"
 		apt-get install linux-image-liquorix-amd64 linux-headers-liquorix-amd64 -y
 	elif [[ "${OS_ID}" == "ubuntu" || "${OS_ID}" == "pop" || "${OS_ID_LIKE}" == *"ubuntu"* ]]; then
 		apt-get install software-properties-common -y
@@ -2279,10 +2538,15 @@ check_status() {
 #  入口执行逻辑
 # =================================================
 
+# 系统检测与镜像测速 (两种入口共用，只跑一次)
+check_sys
+check_cn_status
+
+# 首次运行时自安装到 /usr/local/bin/tcpx (支持 bash <(curl -fsSL ...) 管道方式)
+install_self
+
 # 命令行静默调用参数解析 (免菜单执行)
 if [ $# -gt 0 ]; then
-	check_sys
-	check_cn_status
 	case $1 in
 	op0 | op1 | op2)
 		# 兼容老指令，重定向到自适应新版优化
@@ -2305,6 +2569,4 @@ if [ $# -gt 0 ]; then
 fi
 
 # 常规交互式启动
-check_sys
-check_cn_status
 start_menu
