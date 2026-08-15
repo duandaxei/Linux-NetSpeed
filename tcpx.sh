@@ -6,7 +6,7 @@ export PATH
 # =================================================
 #  全局配置区 (Configuration as Data)
 # =================================================
-readonly SH_VER="100.0.6.6"
+readonly SH_VER="100.0.6.7"
 readonly GITHUB_RAW_URL="https://raw.githubusercontent.com/ylx2016/Linux-NetSpeed/master"
 readonly CLOUD_STATE_FILE="/etc/tcpx_cloud_lastver" # installcloud 记忆上次探测到的最高可安装 Cloud 内核
 
@@ -608,7 +608,8 @@ installbbrplusnew() {
 	head_url=$(get_github_asset "UJX6N/bbrplus-6.x_stable" "${tag_kw}" "headers" "${arch_kw}.*${ext}")
 	img_url=$(get_github_asset "UJX6N/bbrplus-6.x_stable" "${tag_kw}" "${img_kw}" "${arch_kw}.*${ext}")
 
-	install_kernel_generic "BBRplus(UJX6N)新版内核" "$head_url" "$img_url"
+	local kernel_version=$(echo "$img_url" | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -n 1)
+	install_kernel_generic "BBRplus(UJX6N)新版内核" "$head_url" "$img_url" "$kernel_version"
 }
 
 # 安装 BBRplus 内核 4.14.129 (cx9208版)
@@ -873,7 +874,7 @@ installlot() {
 		local lot_ver="4.11.2-1" # CentOS 7 默认
 		[[ "${OS_VERSION_ID}" == "6" ]] && lot_ver="2.6.32-504"
 
-		local base_url="http://${GITHUB_RAW_URL}/lotserver/centos/${OS_VERSION_ID}/x64"
+		local base_url="${GITHUB_RAW_URL}/lotserver/centos/${OS_VERSION_ID}/x64"
 
 		# 先把 4 个包全部下载并校验成功，再动系统 (避免删了旧包却没装上新包)
 		local lot_pkgs=(
@@ -892,7 +893,7 @@ installlot() {
 			fi
 		done
 
-		rpm --import "http://${GITHUB_RAW_URL}/lotserver/centos/RPM-GPG-KEY-elrepo.org" >/dev/null 2>&1
+		rpm --import "${GITHUB_RAW_URL}/lotserver/centos/RPM-GPG-KEY-elrepo.org" >/dev/null 2>&1
 		remove_old_headers
 		yum remove -y kernel-firmware kernel-headers >/dev/null 2>&1
 
@@ -943,7 +944,7 @@ ask_workload_profile() {
 	local ans
 	echo -e "${INFO} 请选择本机用途 (影响 合包/conntrack 等场景参数；内核转发默认全开):" >&2
 	echo -e "      [1] 网站 / 通用          (Nginx/PHP/DB，主要入站短连接)" >&2
-	echo -e "      [2] 机场代理 / 转发组网  (SS/Xray/Trojan/Hysteria/WireGuard/tun) <-- 默认" >&2
+	echo -e "      [2] 代理 / 转发组网      (SS/Xray/Trojan/Hysteria/WireGuard/tun) <-- 默认" >&2
 	read -t 10 -rp "      输入 1/2 (10 秒无输入或回车默认 [2] 代理): " ans
 	echo >&2
 	case "$ans" in
@@ -1007,7 +1008,7 @@ optimizing_system() {
 	*)
 		autocork=0
 		tune_conntrack=1
-		echo -e "${INFO} 用途=机场代理/转发：关闭合包(低延迟)、抬高 conntrack 上限。"
+		echo -e "${INFO} 用途=代理/转发：关闭合包(低延迟)、抬高 conntrack 上限。"
 		;;
 	esac
 
@@ -1015,22 +1016,25 @@ optimizing_system() {
 	#    注意: sock_buf_max 只是"每 socket 自动调优的上限"，不是默认值。默认值必须
 	#    保持很小 (见下方 rmem_default/wmem_default)，否则每条连接都按上限预留内存，
 	#    高并发下极易 OOM —— 这是旧版最严重的负优化 (8G 机器默认缓冲写到了 64MB)。
-	local sock_buf_max somaxconn file_max
+	local sock_buf_max somaxconn file_max syn_backlog
 	if [ "$total_mem_mb" -ge 8192 ]; then
 		# 8GB 及以上高配机器: 每 socket 上限 64MB (足够覆盖高 BDP 链路，且不虚高)
 		sock_buf_max=67108864
 		somaxconn=1048576
 		file_max=2097152
+		syn_backlog=65535
 	elif [ "$total_mem_mb" -ge 2048 ]; then
 		# 2GB - 8GB 中等配置: 32MB
 		sock_buf_max=33554432
 		somaxconn=65535
 		file_max=1048576
+		syn_backlog=32768
 	else
 		# 2GB 以下小内存机器: 16MB
 		sock_buf_max=16777216
 		somaxconn=32768
 		file_max=524288
+		syn_backlog=16384
 	fi
 
 	# 3. 根据 CPU 核心数动态适配网卡队列与积压
@@ -1079,7 +1083,9 @@ net.ipv4.udp_wmem_min = 8192
 net.ipv4.tcp_mtu_probing = 1
 net.ipv4.tcp_autocorking = $autocork
 net.ipv4.tcp_slow_start_after_idle = 0
-net.ipv4.tcp_max_syn_backlog = $somaxconn
+# tcp_max_syn_backlog 单列一个更保守的值 (不再跟 somaxconn 绑死到百万级)，
+# 半开连接队列过大意义有限且吃内存；配合 syncookies=1 足以应对 SYN 洪水。
+net.ipv4.tcp_max_syn_backlog = $syn_backlog
 # tcp_no_metrics_save=1: 不缓存上条连接的 RTT/cwnd 指标，避免一次抖动的坏指标
 # 拖累后续新连接的初始拥塞窗口 (旧版设为 0 会保存陈旧指标，属负优化)。
 net.ipv4.tcp_no_metrics_save = 1
@@ -1123,10 +1129,21 @@ EOF
 	# 4.1 场景相关：繁忙中转/转发节点抬高连接跟踪表上限，避免 conntrack 打满丢连接。
 	#     nf_conntrack 模块未加载时该键不存在，sysctl 载入会忽略(告警已抑制)，故无害。
 	if [[ "$tune_conntrack" -eq 1 ]]; then
+		local ct_max=262144
+		local ct_hashsize=$((ct_max / 4))
+		# nf_conntrack 的 sysctl 键只在模块加载后才存在；先加载并持久化 (modules-load.d)，
+		# 否则重启后该键缺失、nf_conntrack_max 设置会静默丢失。
+		modprobe nf_conntrack >/dev/null 2>&1
+		echo "nf_conntrack" >/etc/modules-load.d/tcpx-conntrack.conf
+		# 只加大 max 不加大 hashsize(桶数) 会让哈希链变长、查表变慢。
+		# hashsize 经验取 max/4，用 modprobe 选项持久化 (重启加载模块时生效)，并对当前已加载模块即时生效。
+		echo "options nf_conntrack hashsize=${ct_hashsize}" >/etc/modprobe.d/tcpx-conntrack.conf
+		[[ -w /sys/module/nf_conntrack/parameters/hashsize ]] &&
+			echo "$ct_hashsize" >/sys/module/nf_conntrack/parameters/hashsize 2>/dev/null
 		cat >>"$sysctl_conf" <<EOF
 
 # --- 连接跟踪 (用途=代理/转发，繁忙节点防 conntrack 表溢出) ---
-net.netfilter.nf_conntrack_max = 262144
+net.netfilter.nf_conntrack_max = $ct_max
 EOF
 	fi
 
@@ -1201,6 +1218,22 @@ EOF
 	# 产生的卡顿与内存放大；同时不影响真正需要大页的程序主动申请。
 	if [[ -f /sys/kernel/mm/transparent_hugepage/enabled ]]; then
 		echo madvise >/sys/kernel/mm/transparent_hugepage/enabled 2>/dev/null
+		# 上面的 echo 仅本次运行生效，重启回默认。用一个 oneshot 服务在开机时重设。
+		cat >/etc/systemd/system/tcpx-thp.service <<'EOF'
+[Unit]
+Description=Set Transparent HugePage to madvise (tcpx)
+After=local-fs.target
+
+[Service]
+Type=oneshot
+ExecStart=/bin/sh -c 'echo madvise > /sys/kernel/mm/transparent_hugepage/enabled'
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target
+EOF
+		systemctl daemon-reload >/dev/null 2>&1
+		systemctl enable tcpx-thp.service >/dev/null 2>&1
 	fi
 
 	echo -e "${INFO} 系统网络与资源限制自适应优化完成！(建议完成后重启服务器以全面生效)"
@@ -1226,6 +1259,8 @@ tcpfit_present() {
 # 故 tcpfit 存在时若仍写 99-sysctl.conf，用户在菜单里选的算法会被 tcpfit 的 bbr 覆盖。
 # 改写到 99-zz-tcpx-accel.conf (排序在 99-tcpfit.conf 之后)，让用户的显式选择生效。
 readonly TCPX_ACCEL_DROPIN="/etc/sysctl.d/99-zz-tcpx-accel.conf"
+# LotSpeed 开机自启服务：保证重启后 lotspeed 模块被加载且算法被重新应用 (详见 setup_lotspeed_boot_service)
+readonly LOTSPEED_BOOT_SERVICE="/etc/systemd/system/lotspeed-boot.service"
 accel_conf_path() {
 	if tcpfit_present; then
 		echo "$TCPX_ACCEL_DROPIN"
@@ -1267,6 +1302,11 @@ remove_bbr_lotserver() {
 
 	sysctl --system >/dev/null 2>&1
 
+	# 停用 LotSpeed 开机自启服务：切换到 BBR/锐速 等其它算法时若不取消它，
+	# 重启后 lotspeed-boot.service 会重新加载模块并把算法顶回 lotspeed，
+	# 造成"切了却又变回来"的幽灵问题。切到 LotSpeed 的路径会在其后重新启用本服务。
+	systemctl disable --now lotspeed-boot.service >/dev/null 2>&1
+
 	# 修改：停用并卸载 LotSpeed 模块 (但不物理删除文件，以便随时通过菜单快速切换)
 	if command -v lotspeed >/dev/null 2>&1; then
 		lotspeed stop >/dev/null 2>&1
@@ -1287,6 +1327,16 @@ remove_bbr_lotserver() {
 	fi
 }
 
+# 确保 qdisc 对应的 sch_ 模块已加载并在重启后自动加载。
+# 拥塞算法(tcp_congestion_control)写入时内核会按需自动 request_module，
+# 但 default_qdisc 不会：cake/fq_pie 等模块若未加载，写 default_qdisc 会静默失败。
+ensure_qdisc_module() {
+	local q="$1"
+	[[ -z "$q" ]] && return 0
+	modprobe "sch_${q}" >/dev/null 2>&1
+	echo "sch_${q}" >/etc/modules-load.d/tcpx-qdisc.conf
+}
+
 # 统一加速开启函数
 # 用法: enable_acceleration <队列算法> <拥塞控制算法>
 enable_acceleration() {
@@ -1303,6 +1353,7 @@ enable_acceleration() {
 	maybe_offer_disable_tcpfit_shaper
 
 	echo -e "${INFO} 正在应用: ${cc} + ${qdisc} ..."
+	ensure_qdisc_module "$qdisc"
 	local sysctl_conf
 	sysctl_conf=$(accel_conf_path)
 	if [[ "$sysctl_conf" == "$TCPX_ACCEL_DROPIN" ]]; then
@@ -1380,6 +1431,16 @@ remove_all() {
 	# 新增：彻底卸载时，物理清理 LotSpeed 残留文件
 	rm -f /usr/local/bin/lotspeed
 	rm -rf /opt/lotspeed
+	# remove_bbr_lotserver 已 disable --now 了开机服务，这里再物理删除 unit 文件并重载
+	rm -f "$LOTSPEED_BOOT_SERVICE"
+
+	# 清理系统优化持久化产物: THP 服务、qdisc/conntrack 模块自加载与 modprobe 选项
+	systemctl disable --now tcpx-thp.service >/dev/null 2>&1
+	rm -f /etc/systemd/system/tcpx-thp.service
+	rm -f /etc/modules-load.d/tcpx-qdisc.conf
+	rm -f /etc/modules-load.d/tcpx-conntrack.conf
+	rm -f /etc/modprobe.d/tcpx-conntrack.conf
+	systemctl daemon-reload >/dev/null 2>&1
 	# tcpfit 是独立工具，其 sysctl/整形/systemd 单元不归本脚本管理，须单独回滚
 	if tcpfit_present; then
 		echo -e "${TIP} 检测到 tcpfit 仍在管理本机网络参数 (99-tcpfit.conf / tcpfit-qdisc.service 等)。"
@@ -1613,6 +1674,37 @@ startbrutal() {
 	fi
 }
 
+# 创建并启用 LotSpeed 开机自启服务。
+# 开机时 systemd-sysctl 加载 sysctl.d 时 lotspeed 模块可能尚未 modprobe，
+# 那行 tcp_congestion_control=lotspeed 会静默失败并退回 tcpfit 的 bbr。
+# 故用一个 oneshot 服务：先 lotspeed start 加载模块，再 sysctl --system 重刷，
+# 让 99-zz-tcpx-accel.conf 里的 lotspeed 生效 (排序在 99-tcpfit.conf 之后，稳压其默认)。
+setup_lotspeed_boot_service() {
+	local lotspeed_bin sysctl_bin
+	lotspeed_bin=$(command -v lotspeed 2>/dev/null || echo "/usr/local/bin/lotspeed")
+	sysctl_bin=$(command -v sysctl 2>/dev/null || echo "/sbin/sysctl")
+	cat >"$LOTSPEED_BOOT_SERVICE" <<EOF
+[Unit]
+Description=Load LotSpeed and apply congestion control
+After=network.target
+
+[Service]
+Type=oneshot
+ExecStart=${lotspeed_bin} start
+ExecStartPost=${sysctl_bin} --system
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target
+EOF
+	systemctl daemon-reload >/dev/null 2>&1
+	if systemctl enable --now lotspeed-boot.service >/dev/null 2>&1; then
+		echo -e "${INFO} 已启用 LotSpeed 开机自启 (lotspeed-boot.service)，重启后仍为默认算法。"
+	else
+		echo -e "${TIP} LotSpeed 开机自启服务启用失败 (非 systemd 环境?)，重启后可能需手动 lotspeed start。"
+	fi
+}
+
 # 安装启用 LotSpeed (uk0开发)
 install_lotspeed() {
 	echo -e "${INFO} 准备安装并启用 LotSpeed (ml-tcp 分支) ..."
@@ -1636,6 +1728,7 @@ install_lotspeed() {
 		echo "net.ipv4.tcp_congestion_control=lotspeed" >>"$sysctl_conf"
 		sysctl --system >/dev/null 2>&1
 		echo -e "${INFO} LotSpeed 已设置为默认拥塞控制算法！"
+		setup_lotspeed_boot_service
 		maybe_offer_disable_tcpfit_shaper
 	else
 		echo -e "${ERROR} LotSpeed 模块加载失败，请检查上方编译日志（通常是因为内核 Headers 缺失或版本过低）。"
@@ -1657,10 +1750,14 @@ enable_lotspeed_standalone() {
 	# 确保将其写死为默认启动项
 	local sysctl_conf
 	sysctl_conf=$(accel_conf_path)
+	ensure_qdisc_module "fq"
 	sed -i '/net.ipv4.tcp_congestion_control/d; /net.core.default_qdisc/d' /etc/sysctl.d/99-sysctl.conf /etc/sysctl.conf "$TCPX_ACCEL_DROPIN" 2>/dev/null
 	echo "net.core.default_qdisc=fq" >>"$sysctl_conf"
 	echo "net.ipv4.tcp_congestion_control=lotspeed" >>"$sysctl_conf"
 	sysctl --system >/dev/null 2>&1
+
+	# remove_bbr_lotserver 已先禁用旧的开机服务，此处按当前 LotSpeed 状态重新启用
+	setup_lotspeed_boot_service
 
 	echo -e "${INFO} LotSpeed 加速已成功切换并启用！"
 }
@@ -1837,25 +1934,12 @@ EOF
 }
 
 # 调起 tcpfit 进行网络精调 (自适应 BDP/内存的独立工具)
-# 说明: tcpfit 是独立项目，tcpx 不内置其脚本，也不硬编码不可信的远程下载地址。
-#       优先调用已安装的 tcpfit；否则回退到脚本同目录的 tcpfit.sh；都没有则提示。
+# 按要求：菜单 [60] 直接从上游一键运行 tcpfit，不做任何检测或提示。
+# 注意: 此处走原生 curl 直连，未使用脚本内的镜像/落盘校验逻辑；
+#       国内网络若无法直连 raw.githubusercontent.com 可能失败。
 run_tcpfit_tune() {
-	if command -v tcpfit >/dev/null 2>&1; then
-		echo -e "${INFO} 检测到已安装 tcpfit，正在调起..."
-		tcpfit
-		return $?
-	fi
-	local self_dir
-	self_dir=$(dirname "$(readlink -f "$0" 2>/dev/null || echo "$0")")
-	if [[ -f "$self_dir/tcpfit.sh" ]]; then
-		echo -e "${INFO} 检测到同目录 tcpfit.sh，正在运行..."
-		bash "$self_dir/tcpfit.sh"
-		return $?
-	fi
-	echo -e "${ERROR} 未检测到 tcpfit。"
-	echo -e "${TIP} tcpfit 为独立项目，请先自行安装 (安装后本机会出现 /usr/local/bin/tcpfit)。"
-	echo -e "${TIP} 安装后 tcpx 会自动识别，并在切换加速算法/系统优化时避免与其冲突。"
-	return 1
+	echo -e "${INFO} 正在调起 tcpfit 进行网络精调..."
+	bash <(curl -fsSL https://raw.githubusercontent.com/Kylin010/tcpfit/main/tcpfit.sh)
 }
 
 # =================================================
